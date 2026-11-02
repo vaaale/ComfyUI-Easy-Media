@@ -138,8 +138,8 @@ class EasyMinimaxPromptOverride(io.ComfyNode):
                     default="shot",
                     tooltip=(
                         "Continuity mode per clip. Supported values are shot, "
-                        "context, and context_drift (legacy context_swap); a single value "
-                        "applies to every "
+                        "context, context_drift (legacy context_swap), and "
+                        "last_frame_ref; a single value applies to every "
                         "clip, while comma-separated values like shot,context,context "
                         "assign modes in order and reuse the last value when fewer "
                         "are provided."
@@ -2479,7 +2479,7 @@ class EasyH3ProjectArtifact(io.ComfyNode):
                 TYPE_TRACKS_INFO.Input("tracks_info"),
                 io.Combo.Input(
                     "continuity_mode",
-                    options=["shot", "context", "context_drift", "context_swap"],
+                    options=["shot", "context", "context_drift", "context_swap", "last_frame_ref"],
                     default="shot",
                 ),
                 io.Combo.Input(
@@ -2530,9 +2530,10 @@ class EasyH3ProjectArtifact(io.ComfyNode):
         if sampling_pass not in {"single", "first", "second"}:
             raise ValueError("sampling_pass must be 'single', 'first', or 'second'")
         continuity_mode = str(continuity_mode).lower()
-        if continuity_mode not in {"shot", "context", "context_drift", "context_swap"}:
+        if continuity_mode not in {"shot", "context", "context_drift", "context_swap", "last_frame_ref"}:
             raise ValueError(
-                "continuity_mode must be 'shot', 'context', 'context_drift', or 'context_swap'"
+                "continuity_mode must be 'shot', 'context', 'context_drift', 'context_swap', "
+                "or 'last_frame_ref'"
             )
         if continuity_mode == "context_swap":
             continuity_mode = "context_drift"
