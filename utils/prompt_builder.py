@@ -708,6 +708,9 @@ Write complete dialogue and lyrics only inside `<d>` in `detailed_description`; 
 ## 7. Complete Example
 
 <details>
+subject_definitions:
+<Subject 1> is the young woman from <Picture 1>.
+
 <summary>Show the complete example</summary>
 
 ```text

@@ -1398,6 +1398,7 @@ class EasyMultiTrackProject(io.ComfyNode):
 
         previous_hires_context_latent: Any | None = None
         previous_low_context_latent: Any | None = None
+        previous_reference_frame: Any | None = None
         previous_artifact: Any | None = None
         last_project_output: Any | None = None
         report_step(35)
@@ -1539,6 +1540,7 @@ class EasyMultiTrackProject(io.ComfyNode):
                 previous_artifact = last_project_output = artifact.out(0)
                 previous_hires_context_latent = runtime_context_latent
                 previous_low_context_latent = runtime_context_latent
+                previous_reference_frame = passthrough.out(1)
                 segment_nodes.update({
                     node_id: task_index
                     for node_id in graph.nodes.keys() - previous_graph_nodes
@@ -1574,9 +1576,26 @@ class EasyMultiTrackProject(io.ComfyNode):
                     **{"values.a": task_length},
                 ).out(1)
             report_segment_step(0.10)
+            task_images = task_output.out(4)
+            if continuity_mode == "last_frame_ref" and generation_mode != "reference":
+                log_node_info(
+                    node_name,
+                    f"Segment {task_index}: last_frame_ref needs ref/edit task mode; "
+                    "ignoring it, this segment has no motion continuity",
+                )
+            elif (
+                continuity_mode == "last_frame_ref"
+                and previous_reference_frame is not None
+            ):
+                task_images = graph.node(
+                    "easy h3PreviousFrameReference",
+                    id=f"previous_frame_reference_{task_index}",
+                    images=task_images,
+                    previous_video=previous_reference_frame,
+                ).out(0)
             conditioning_inputs = {
                 "clip": clip, "vae": vae, "audio_vae": audio_vae,
-                "images": task_output.out(4), "prompt": task_output.out(1),
+                "images": task_images, "prompt": task_output.out(1),
                 "mode": generation_mode,
                 "width": target_width if is_selflift else first_pass_width,
                 "height": target_height if is_selflift else first_pass_height,
@@ -2187,6 +2206,7 @@ class EasyMultiTrackProject(io.ComfyNode):
                 )
                 saved_media_inputs = {"video_path": saved_video_end.out(0)}
 
+            previous_reference_frame = output_images if not audio_only else None
             saved_hires_context_latent = project_hires_context_latent
             saved_low_context_latent = project_low_context_latent
             hires_trim_inputs: dict[str, Any] = {

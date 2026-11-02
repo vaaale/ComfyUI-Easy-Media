@@ -1181,6 +1181,42 @@ class EasyH3MotionContextLatentTrim(io.ComfyNode):
         return io.NodeOutput(output)
 
 
+class EasyH3PreviousFrameReference(io.ComfyNode):
+    """Append the previous segment's last decoded frame as a plain reference image."""
+
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="easy h3PreviousFrameReference",
+            display_name="H3 Previous Frame Reference",
+            category="EasyUse/H3/dev",
+            description=(
+                "Internal H3 project helper for the last_frame_ref continuity mode: "
+                "appends the previous segment's last decoded frame to a reference "
+                "image list as a plain reference, not a motion-context anchor."
+            ),
+            is_input_list=True,
+            inputs=[
+                io.Image.Input("images", optional=True),
+                io.Image.Input("previous_video", optional=True),
+            ],
+            outputs=[io.Image.Output("IMAGES", is_output_list=True)],
+            is_dev_only=True,
+        )
+
+    @classmethod
+    def execute(
+        cls,
+        images: Any | None = None,
+        previous_video: Any | None = None,
+    ) -> io.NodeOutput:
+        combined = expand_image_inputs(images)
+        previous_frames = expand_image_inputs(previous_video)
+        if previous_frames:
+            combined.append(previous_frames[-1])
+        return io.NodeOutput(combined)
+
+
 class EasyH3ProjectContextLatentLoad(io.ComfyNode):
     """Load the active context latent for a previously rendered segment."""
 

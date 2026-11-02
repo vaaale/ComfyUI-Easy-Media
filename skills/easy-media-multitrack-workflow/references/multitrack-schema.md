@@ -125,7 +125,9 @@ custom 示例：
 ```
 
 - `task_mode`: `default`、`l2v`、`ref`、`edit`。
-- `continuity_mode`: `shot`（独立镜头）、`context`（普通上下文衔接）或 `context_drift`（上下文漂移控制）；旧值 `context_swap` 仍可读取。
+- `continuity_mode`: `shot`（独立镜头）、`context`（普通上下文衔接）、`context_drift`（上下文漂移控制）或 `last_frame_ref`（末帧作为参考）；旧值 `context_swap` 仍可读取。
+- `last_frame_ref` 用于需要反打镜头（机位完全反转）但场景或人物仍需保持可识别的片段：不做任何帧锁定或运动衔接（效果等同 `shot`），只是把上一段最终解码出的最后一帧作为普通参考图附加给本段——而不是像 `context`/`context_drift` 那样锁定首帧或运动。仅在 `task_mode: "ref"` 时生效（`default`/`l2v` 片段没有非定位的参考位，设置后会被忽略）。
+
 - `ref_image_size`: `match` 或 `max`。
 - `images` 最多 9 张，顺序决定 Picture 引用顺序。
 - 编辑已有任务时保留未要求改变的 `system_prompt`、prompt variant、连续性和参考图策略。
