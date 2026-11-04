@@ -11,11 +11,8 @@ interface ToggleableWidget {
 
 interface ToggleableNode {
   widgets?: ToggleableWidget[]
-  size?: [number, number]
   onNodeCreated?: (...args: unknown[]) => void
   onConfigure?: (...args: unknown[]) => void
-  computeSize?: () => [number, number]
-  setSize?: (size: [number, number]) => void
   setDirtyCanvas?: (fg: boolean, bg?: boolean) => void
   graph?: { setDirtyCanvas?: (fg: boolean, bg?: boolean) => void }
 }
@@ -38,14 +35,11 @@ function applyEnhancerVisibility(node: ToggleableNode) {
   for (let index = anchorIndex + 1; index < widgets.length; index += 1) {
     setWidgetVisible(widgets[index], enabled)
   }
-  // Only ever adjust height: computeSize() recalculates width from the
-  // widget label set alone, ignoring the DOM-rendered editor's actual
-  // content width, and would otherwise collapse the node horizontally.
-  const currentWidth = node.size?.[0]
-  const computed = node.computeSize?.()
-  if (computed && currentWidth !== undefined) {
-    node.setSize?.([currentWidth, computed[1]])
-  }
+  // Deliberately never call setSize/computeSize here: computeSize() derives
+  // a from-scratch minimum that ignores the DOM-rendered editor's actual
+  // (user-resized) width/height, and overwriting node.size with it collapses
+  // whichever dimension computeSize() under-reports. Hidden widgets simply
+  // stop contributing to the node's natural layout; no manual resize needed.
   node.setDirtyCanvas?.(true, true)
   node.graph?.setDirtyCanvas?.(true, true)
 }
