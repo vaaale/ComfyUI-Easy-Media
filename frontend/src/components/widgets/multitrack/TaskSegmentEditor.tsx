@@ -1,5 +1,6 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
-import { CloudUpload, Eye, Pencil, Plus, RotateCcw, Share2, Trash2 } from 'lucide-react'
+import { CloudUpload, Eye, Pencil, Plus, RotateCcw, Share2, Trash2, X } from 'lucide-react'
+import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import {
   Dialog,
@@ -65,6 +66,7 @@ import type {
   MultiTrackRefImageSize,
   MultiTrackSegment,
   MultiTrackSegmentContent,
+  MultiTrackSegmentLora,
   MultiTrackSourceType,
   MultiTrackTaskImage,
   MultiTrackTaskMode,
@@ -335,6 +337,34 @@ export function TaskSegmentEditor({
       cancelled = true
     }
   }, [isSceneStudio])
+  const [loraPickerOpen, setLoraPickerOpen] = useState(false)
+  const [loraFilter, setLoraFilter] = useState('')
+  const segmentLoras = segment.content.loras ?? []
+  const selectedLoraNames = useMemo(
+    () => new Set(segmentLoras.map((lora) => lora.name)),
+    [segmentLoras],
+  )
+  const filteredLoraOptions = useMemo(() => (
+    loraOptions.filter((name) => (
+      !selectedLoraNames.has(name) && name.toLowerCase().includes(loraFilter.toLowerCase())
+    ))
+  ), [loraOptions, selectedLoraNames, loraFilter])
+
+  function addLora(name: string) {
+    if (selectedLoraNames.has(name)) return
+    onContentChange({ loras: [...segmentLoras, { name, strength: 1 }] })
+  }
+
+  function updateLora(index: number, patch: Partial<MultiTrackSegmentLora>) {
+    onContentChange({
+      loras: segmentLoras.map((lora, loraIndex) => (loraIndex === index ? { ...lora, ...patch } : lora)),
+    })
+  }
+
+  function removeLora(index: number) {
+    onContentChange({ loras: segmentLoras.filter((_, loraIndex) => loraIndex !== index) })
+  }
+
   const editableSegments = useMemo(() => (
     trackSegments && trackSegments.length > 0 ? trackSegments : [segment]
   ), [segment, trackSegments])
@@ -1280,6 +1310,85 @@ export function TaskSegmentEditor({
         </ResizablePanelGroup>
       </div>
 
+      {isSceneStudio && (
+        <div className="flex shrink-0 flex-wrap items-center gap-1.5 border-t border-dashed border-border px-2 py-1.5">
+          <span className="shrink-0 text-[10px] text-muted-foreground">{t('sceneStudio.lora')}</span>
+          {segmentLoras.map((lora, loraIndex) => (
+            <Badge
+              key={`${lora.name}-${loraIndex}`}
+              variant="secondary"
+              className="gap-1 py-0.5 pl-2 pr-1 font-normal"
+            >
+              <span className="max-w-32 truncate text-[10px]" title={lora.name}>{lora.name}</span>
+              <NumberInput
+                aria-label={t('sceneStudio.loraStrength')}
+                className="h-5 w-12 border-none bg-transparent px-1 text-[10px]"
+                min={-10}
+                max={10}
+                step={0.05}
+                value={lora.strength}
+                onChange={(value) => updateLora(loraIndex, { strength: value })}
+              />
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon"
+                className="h-4 w-4 cursor-pointer text-muted-foreground hover:text-destructive"
+                aria-label={t('sceneStudio.removeLora', { name: lora.name })}
+                onClick={() => removeLora(loraIndex)}
+              >
+                <X className="h-3 w-3" />
+              </Button>
+            </Badge>
+          ))}
+          <Popover
+            open={loraPickerOpen}
+            onOpenChange={(open) => {
+              setLoraPickerOpen(open)
+              if (!open) setLoraFilter('')
+            }}
+          >
+            <PopoverTrigger asChild>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                className="h-6 gap-1 px-2 text-[10px] cursor-pointer"
+              >
+                <Plus className="h-3 w-3" />
+                {t('sceneStudio.addLora')}
+              </Button>
+            </PopoverTrigger>
+            <PopoverContent align="start" className="w-64 p-2">
+              <Input
+                autoFocus
+                placeholder={t('sceneStudio.searchLora')}
+                value={loraFilter}
+                onChange={(event) => setLoraFilter(event.target.value)}
+                className="mb-2 h-7 text-xs"
+              />
+              <div className="flex max-h-56 flex-col gap-0.5 overflow-y-auto">
+                {filteredLoraOptions.length === 0 ? (
+                  <p className="px-1 py-2 text-[10px] text-muted-foreground">{t('sceneStudio.noLorasFound')}</p>
+                ) : (
+                  filteredLoraOptions.map((loraName) => (
+                    <Button
+                      key={loraName}
+                      type="button"
+                      variant="ghost"
+                      className="h-auto justify-start truncate px-2 py-1.5 text-left text-[10px] font-normal cursor-pointer"
+                      onClick={() => addLora(loraName)}
+                    >
+                      {loraName}
+                    </Button>
+                  ))
+                )}
+              </div>
+            </PopoverContent>
+          </Popover>
+        </div>
+      )}
+
       <div className="relative flex shrink-0 items-center justify-between border-t border-dashed border-border p-2">
         <Tabs value={editMode} onValueChange={(value) => setEditMode(value as EditMode)} className={showEditModeToggle ? undefined : 'hidden'}>
           <TabsList className="h-8 bg-card">
@@ -1332,46 +1441,6 @@ export function TaskSegmentEditor({
         </div>
 
         <div className="flex items-center gap-2">
-          {isSceneStudio && (
-            <Select
-              value={segment.content.lora_name ?? '__none__'}
-              onValueChange={(value) => handleDropdownContentChange({
-                lora_name: value === '__none__' ? '' : value,
-              })}
-            >
-              <TooltipProvider delayDuration={300}>
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <SelectTrigger aria-label={t('sceneStudio.lora')} className="h-8 w-28 bg-card text-[10px]">
-                      <SelectValue />
-                    </SelectTrigger>
-                  </TooltipTrigger>
-                  <TooltipContent side="bottom" className="max-w-72">
-                    {t('sceneStudio.lora')}
-                  </TooltipContent>
-                </Tooltip>
-              </TooltipProvider>
-              <SelectContent>
-                <SelectItem value="__none__"><span className="text-[10px]">{t('sceneStudio.noLora')}</span></SelectItem>
-                {loraOptions.map((loraName) => (
-                  <SelectItem key={loraName} value={loraName}>
-                    <span className="text-[10px]">{loraName}</span>
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          )}
-          {isSceneStudio && segment.content.lora_name && (
-            <NumberInput
-              aria-label={t('sceneStudio.loraStrength')}
-              className="h-8 w-16 bg-card text-[10px]"
-              min={-10}
-              max={10}
-              step={0.05}
-              value={segment.content.lora_strength ?? 1}
-              onChange={(value) => handleDropdownContentChange({ lora_strength: value })}
-            />
-          )}
           {isSceneStudio && (
             <Tooltip>
               <TooltipTrigger asChild>

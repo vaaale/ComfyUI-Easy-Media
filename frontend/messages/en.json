@@ -92,7 +92,10 @@
     "renderSegment": "Render this segment",
     "lora": "LoRA",
     "loraStrength": "LoRA strength",
-    "noLora": "None",
+    "addLora": "Add LoRA",
+    "searchLora": "Search LoRAs…",
+    "noLorasFound": "No matching LoRAs",
+    "removeLora": "Remove {name}",
     "enhancedPrompt": "Enhanced prompt",
     "copyToUserPrompt": "Copy to user prompt"
   },

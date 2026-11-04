@@ -1276,12 +1276,9 @@ def _execute_h3_project_core(cls, *, lora_resolver=None, **kwargs: Any) -> io.No
             if isinstance(content, dict)
             else "match"
         )
-        segment_lora_name = ""
-        segment_lora_strength = 1.0
+        segment_loras: list[tuple[str, float]] = []
         if lora_resolver is not None and isinstance(content, dict):
-            resolved_lora = lora_resolver(content)
-            if resolved_lora is not None:
-                segment_lora_name, segment_lora_strength = resolved_lora
+            segment_loras = lora_resolver(content) or []
         report_segment_step(0.0)
         report_segment_step(0.04)
         task_start_frame = max(0, int(entry.get("start_frame", 0)))
@@ -1553,13 +1550,13 @@ def _execute_h3_project_core(cls, *, lora_resolver=None, **kwargs: Any) -> io.No
             ).out(0)
 
         segment_model = model
-        if segment_lora_name:
+        for lora_index, (lora_name, lora_strength) in enumerate(segment_loras):
             segment_model = graph.node(
                 "LoraLoaderModelOnly",
-                id=f"segment_lora_{task_index}",
-                model=model,
-                lora_name=segment_lora_name,
-                strength_model=segment_lora_strength,
+                id=f"segment_lora_{task_index}_{lora_index}",
+                model=segment_model,
+                lora_name=lora_name,
+                strength_model=lora_strength,
             ).out(0)
         first_pass_sampling_model = segment_model
         if has_context_continuity:
@@ -2370,18 +2367,25 @@ _SCENE_STUDIO_PROJECT_INPUT_NAMES = (
 )
 
 
-def _scene_studio_lora_resolver(content: dict) -> tuple[str, float] | None:
-    """Resolve a segment's optional per-segment LoRA, ignoring unknown filenames."""
-    lora_name = content.get("lora_name")
-    if not isinstance(lora_name, str) or not lora_name:
-        return None
-    if lora_name not in folder_paths.get_filename_list("loras"):
-        return None
-    try:
-        strength = float(content.get("lora_strength", 1.0))
-    except (TypeError, ValueError):
-        strength = 1.0
-    return lora_name, strength
+def _scene_studio_lora_resolver(content: dict) -> list[tuple[str, float]]:
+    """Resolve a segment's per-segment LoRA stack, ignoring unknown filenames."""
+    raw_loras = content.get("loras")
+    if not isinstance(raw_loras, list):
+        return []
+    available = set(folder_paths.get_filename_list("loras"))
+    resolved: list[tuple[str, float]] = []
+    for entry in raw_loras:
+        if not isinstance(entry, dict):
+            continue
+        lora_name = entry.get("name")
+        if not isinstance(lora_name, str) or not lora_name or lora_name not in available:
+            continue
+        try:
+            strength = float(entry.get("strength", 1.0))
+        except (TypeError, ValueError):
+            strength = 1.0
+        resolved.append((lora_name, strength))
+    return resolved
 
 
 def _scene_studio_render(cls, *, tracks_info: dict, **project_kwargs: Any) -> io.NodeOutput:

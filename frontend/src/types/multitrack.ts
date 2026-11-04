@@ -51,8 +51,7 @@ export interface MultiTrackSegmentContent {
   task_mode?: MultiTrackTaskMode
   continuity_mode?: MultiTrackContinuityMode
   ref_image_size?: MultiTrackRefImageSize
-  lora_name?: string
-  lora_strength?: number
+  loras?: MultiTrackSegmentLora[]
   enhanced_prompt?: string
   images?: MultiTrackTaskImage[]
   duration?: number
@@ -66,6 +65,11 @@ export interface MultiTrackSegmentContent {
   speaker_reference?: boolean
   subtitle_style?: MultiTrackSubtitleStyle
   subtitle_speech?: MultiTrackSubtitleSpeechSettings
+}
+
+export interface MultiTrackSegmentLora {
+  name: string
+  strength: number
 }
 
 export interface MultiTrackSubtitleSpeechSettings {

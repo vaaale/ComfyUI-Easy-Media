@@ -92,7 +92,10 @@
     "renderSegment": "渲染此片段",
     "lora": "LoRA",
     "loraStrength": "LoRA 强度",
-    "noLora": "无",
+    "addLora": "添加 LoRA",
+    "searchLora": "搜索 LoRA…",
+    "noLorasFound": "未找到匹配的 LoRA",
+    "removeLora": "移除 {name}",
     "enhancedPrompt": "增强后的提示词",
     "copyToUserPrompt": "复制到用户提示词"
   },
