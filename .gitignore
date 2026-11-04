@@ -1,6 +1,5 @@
 .idea
 .memsearch
-dist
 fast-workflows
 __pycache__
 .DS_Store
