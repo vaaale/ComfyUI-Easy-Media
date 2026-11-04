@@ -11,6 +11,7 @@ interface ToggleableWidget {
 
 interface ToggleableNode {
   widgets?: ToggleableWidget[]
+  size?: [number, number]
   onNodeCreated?: (...args: unknown[]) => void
   onConfigure?: (...args: unknown[]) => void
   computeSize?: () => [number, number]
@@ -37,7 +38,14 @@ function applyEnhancerVisibility(node: ToggleableNode) {
   for (let index = anchorIndex + 1; index < widgets.length; index += 1) {
     setWidgetVisible(widgets[index], enabled)
   }
-  if (node.computeSize) node.setSize?.(node.computeSize())
+  // Only ever adjust height: computeSize() recalculates width from the
+  // widget label set alone, ignoring the DOM-rendered editor's actual
+  // content width, and would otherwise collapse the node horizontally.
+  const currentWidth = node.size?.[0]
+  const computed = node.computeSize?.()
+  if (computed && currentWidth !== undefined) {
+    node.setSize?.([currentWidth, computed[1]])
+  }
   node.setDirtyCanvas?.(true, true)
   node.graph?.setDirtyCanvas?.(true, true)
 }
