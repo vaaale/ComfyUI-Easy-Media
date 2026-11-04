@@ -15,6 +15,7 @@ import { DEFAULT_PROJECT_DATA } from '@/types/project'
 import { suppressCompareVideoDefaultPreview } from '@/lib/compare-video-node'
 import { installWorkflowSubmission } from '@/lib/workflow-submission'
 import { installProjectSamplingPreview } from '@/lib/project-sampling-preview-node'
+import { installSceneStudioWidgetToggle } from '@/lib/scene-studio-widget-toggle'
 
 declare const __COMFY_EASY_MEDIA_GLOBAL_CSS__: string;
 
@@ -65,6 +66,7 @@ comfyApp.registerExtension({
     installEasyMediaSyncPlay(nodeType, nodeData)
     suppressCompareVideoDefaultPreview(nodeType, nodeData)
     installProjectSamplingPreview(nodeType, nodeData, comfyApp)
+    installSceneStudioWidgetToggle(nodeType, nodeData)
   },
 
   getNodeMenuItems(node) {

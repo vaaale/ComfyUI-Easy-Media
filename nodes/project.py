@@ -44,7 +44,6 @@ from ..utils.project_memory import (
     install_project_memory_cleanup,
 )
 from ..utils.multitrack import _parse_track_data
-from ..utils.scenes import save_scene
 from .basic import (
     LLAMACPP_MODEL,
     MINIMAX_MODEL,
@@ -2461,17 +2460,6 @@ class EasySceneStudio(io.ComfyNode):
                 io.Image.Input("image", optional=True, lazy=True, tooltip="Optional image media list for slot-based multitrack segments."),
                 io.Audio.Input("audio", optional=True, lazy=True, tooltip="Optional audio media list for slot-based multitrack segments."),
                 io.Video.Input("video", optional=True, lazy=True, tooltip="Optional video media list for slot-based multitrack segments."),
-                io.String.Input(
-                    "scene_name",
-                    default="",
-                    tooltip="Name used to save this timeline as a scene.",
-                ),
-                io.Combo.Input(
-                    "scene_action",
-                    options=["none", "save"],
-                    default="none",
-                    tooltip="Set to 'save' to persist the current track_data under scene_name when this node runs.",
-                ),
                 TYPE_FAST_MODEL_LOADER.Input(
                     "model_loader", raw_link=True, lazy=True,
                 ),
@@ -2703,12 +2691,6 @@ class EasySceneStudio(io.ComfyNode):
             video=kwargs.get("video"),
         )
         tracks_info, images_out, audio_out, video_out = editor_output[0:4]
-
-        scene_action = str(_unwrap_list_scalar(kwargs.get("scene_action"), "none")).lower()
-        scene_name = str(_unwrap_list_scalar(kwargs.get("scene_name"), "")).strip()
-        if scene_action == "save" and scene_name:
-            raw_track_data = _unwrap_list_scalar(kwargs.get("track_data"), {})
-            save_scene(scene_name, _parse_track_data(raw_track_data))
 
         project_kwargs = {
             name: kwargs[name]

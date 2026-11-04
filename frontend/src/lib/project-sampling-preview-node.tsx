@@ -3,7 +3,7 @@ import type { ComfyApp } from '@comfyorg/comfyui-frontend-types'
 import { SamplingPreviewWidget } from '@/components/widgets/SamplingPreviewWidget'
 import { CUSTOM_NODE_CLASS } from '@/lib/constants'
 
-const NODE_NAME = 'easy multitrackProject'
+const NODE_NAMES = new Set(['easy multitrackProject', 'easy sceneStudio'])
 const WIDGET_NAME = 'easy-media-sampling-preview'
 const COLLAPSED_HEIGHT = 8
 const PREVIEW_HEIGHT = 280
@@ -139,7 +139,7 @@ export function installProjectSamplingPreview(
   nodeData: { name?: string },
   app: ComfyApp,
 ) {
-  if (nodeData.name !== NODE_NAME) return
+  if (!nodeData.name || !NODE_NAMES.has(nodeData.name)) return
   const prototype = nodeType.prototype as PreviewNode
   const originalCreated = prototype.onNodeCreated
   const originalExecutionStart = prototype.onExecutionStart
