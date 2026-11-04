@@ -43,6 +43,25 @@ from ..utils.project_memory import (
     SEGMENT_META,
     install_project_memory_cleanup,
 )
+from ..utils.multitrack import _parse_track_data
+from ..utils.scenes import save_scene
+from .basic import (
+    LLAMACPP_MODEL,
+    MINIMAX_MODEL,
+    VIDEO_FORMATS,
+    CATEGORY_MULTITRACK,
+    SCENE_STUDIO_PROMPT_APPLY_NODE_ID,
+    TYPE_LLAMACPP_MODEL,
+    TYPE_PROMPT_ENHANCER_ACCOUNT,
+    TYPE_TRACK_DATA,
+    MultiTrackEditor,
+    MultiTrackPromptEnhancer,
+    MultiTrackTaskOutput,
+    _apply_multitrack_enhanced_prompts_to_field,
+    _multitrack_task_segments,
+    _unwrap_list_scalar,
+    resolution_combo_options,
+)
 from ..utils.multitrack import (
     MULTITRACK_RUNTIME_CACHE_KEY,
     multitrack_runtime_cache,
@@ -857,6 +876,1297 @@ class EasyH3ProjectStaticPrepare(io.ComfyNode):
             raise RuntimeError(f"Failed to prepare H3 project static inputs: {error}") from error
 
 
+def _execute_h3_project_core(cls, *, lora_resolver=None, **kwargs: Any) -> io.NodeOutput:
+    node_name = "MultiTrack Project"
+    progress_total = 100
+    progress_bar = ProgressBar(progress_total)
+    progress_value = 0
+
+    def report_step(target: float) -> None:
+        nonlocal progress_value
+        progress_value = max(
+            progress_value,
+            min(progress_total, int(round(target))),
+        )
+        progress_bar.update_absolute(progress_value, progress_total)
+
+    report_step(0)
+    selected_model_loader = _raw_project_input(kwargs.get("model_loader"))
+    uses_linked_prepare = is_link(selected_model_loader)
+    if not uses_linked_prepare and not isinstance(selected_model_loader, dict):
+        raise TypeError("model_loader must contain a FAST_MODEL_LOADER dictionary.")
+
+    model = None if uses_linked_prepare else selected_model_loader.get("model")
+    clip = None if uses_linked_prepare else selected_model_loader.get("clip")
+    vae = None if uses_linked_prepare else selected_model_loader.get("vae")
+    audio_vae = None if uses_linked_prepare else selected_model_loader.get("audio_vae")
+    preview_vae = None if uses_linked_prepare else selected_model_loader.get("preview_vae")
+    preview_node_id = str(
+        _first_input(
+            getattr(getattr(cls, "hidden", None), "unique_id", None),
+            "",
+        )
+    )
+    has_sampling_preview = bool(preview_node_id) and (uses_linked_prepare or preview_vae is not None)
+    missing_components = [] if uses_linked_prepare else [
+        name
+        for name, value in (("model", model), ("clip", clip), ("vae", vae))
+        if value is None
+    ]
+    if missing_components:
+        raise ValueError(
+            "model_loader is missing required components: "
+            + ", ".join(missing_components)
+        )
+    if not uses_linked_prepare:
+        _require_minimax_h3_model(model)
+    info = parse_tracks_info(kwargs.get("tracks_info"))
+    hidden_inputs = getattr(cls, "hidden", None)
+    validate_h3_project_outputs(
+        info,
+        getattr(hidden_inputs, "prompt", None),
+        getattr(hidden_inputs, "unique_id", None),
+    )
+    report_step(5)
+
+    sampling_mode, sampling_config = _h3_sampling_mode_config(
+        kwargs.get("sampling_mode")
+    )
+    is_passthrough = sampling_mode == "passthrough"
+    is_selflift = sampling_mode == "selflift"
+    has_second_pass = sampling_mode == "dual"
+    transition_ratio = 0.6
+    lowres_scale = 0.6
+    tiling_enabled, tile_count = _h3_tiling_config(kwargs.get("enabled_tiling"))
+    if is_selflift:
+        transition_ratio = float(
+            _first_input(sampling_config.get("transition_ratio"), 0.6)
+        )
+        lowres_scale = float(
+            _first_input(sampling_config.get("lowres_scale"), 0.6)
+        )
+        legacy_highres_tiling = bool(
+            _first_input(sampling_config.get("highres_tiling"), False)
+        )
+        if legacy_highres_tiling and not tiling_enabled:
+            tiling_enabled = True
+            tile_count = 0
+    first_pass_only = bool(
+        _first_input(
+            sampling_config.get("1st_pass_only"),
+            _first_input(kwargs.get("1st_pass_only"), False),
+        )
+    )
+    run_second_pass = has_second_pass and not first_pass_only
+    if is_selflift:
+        first_pass_only = False
+    disable_2nd_noise = bool(
+        _first_input(
+            sampling_config.get("disable_2nd_noise"),
+            _first_input(kwargs.get("disable_2nd_noise"), False),
+        )
+    )
+    second_model = model
+    second_model_loader = None
+    if run_second_pass or is_selflift:
+        configured_second_loader = sampling_config.get("model_loader_2nd")
+        second_model_loader = _raw_project_input(
+            configured_second_loader if configured_second_loader is not None
+            else kwargs.get("model_loader_2nd")
+        )
+        if not uses_linked_prepare:
+            second_model = _h3_second_pass_model(second_model_loader, model=model)
+            _require_minimax_h3_model(second_model)
+    report_step(10)
+
+    hidden_inputs = getattr(cls, "hidden", None)
+    prompt_turbo_detection = None
+    turbo_detection = None if uses_linked_prepare else detect_turbo_model(model)
+    if uses_linked_prepare or not turbo_detection.is_turbo:
+        prompt_turbo_detection = detect_turbo_lora_from_prompt(
+            getattr(hidden_inputs, "prompt", None),
+            getattr(hidden_inputs, "unique_id", None),
+        )
+        if uses_linked_prepare or prompt_turbo_detection is not None:
+            turbo_detection = prompt_turbo_detection
+    first_is_turbo = bool(turbo_detection and turbo_detection.is_turbo)
+    report_step(15)
+    second_turbo_detection = turbo_detection
+    if run_second_pass and not uses_linked_prepare and second_model is not model:
+        second_turbo_detection = detect_turbo_model(second_model)
+        report_step(16)
+    second_is_turbo = bool(second_turbo_detection and second_turbo_detection.is_turbo)
+
+    safe_project_name = safe_h3_project_name(kwargs.get("project_name"))
+    project_save = str(_first_input(kwargs.get("project_save"), "new"))
+    if project_save not in {"new", "override"}:
+        raise ValueError("project_save must be 'new' or 'override'")
+    upscale_by = float(
+        _first_input(
+            sampling_config.get("upscale_by"),
+            _first_input(kwargs.get("upscale_by"), 1.250),
+        )
+    )
+    if not math.isfinite(upscale_by) or upscale_by < 1:
+        raise ValueError(
+            "upscale_by must be a finite value greater than or equal to 1"
+        )
+
+    first_pass_width = int(info["width"])
+    first_pass_height = int(info["height"])
+    audio_only = (first_pass_width, first_pass_height) == (32, 32)
+    fps = float(info["frame_rate"])
+    target_width, target_height = h3_second_pass_dimensions(
+        first_pass_width,
+        first_pass_height,
+        run_second_pass,
+        upscale_by,
+    )
+    # Keep task inputs at the configured size; exports use the final size.
+    output_info = {**info, "width": target_width, "height": target_height}
+    initialize_h3_project(
+        safe_project_name,
+        output_info,
+        folder_paths.get_output_directory(),
+    )
+    all_entries = h3_task_entries(info)
+    segment_start_number = int(_first_input(kwargs.get("segment_start_number"), 1))
+    if segment_start_number < 1:
+        raise ValueError("segment_start_number must be at least 1")
+    segment_start_index = segment_start_number - 1
+    segment_count = int(_first_input(kwargs.get("segment_count"), -1))
+    selected_entries = select_h3_task_entries(
+        all_entries,
+        segment_start_index,
+        segment_count,
+    )
+    if not selected_entries:
+        raise ValueError(
+            "No H3 task segments are available from segment_start_number."
+        )
+    has_sampling_tasks = not is_passthrough and any(
+        not h3_task_is_passthrough(entry) for _, entry in selected_entries
+    )
+
+    first_selected_index, first_selected_entry = selected_entries[0]
+    first_selected_task = first_selected_entry.get("task", {})
+    first_selected_content = (
+        first_selected_task.get("content", {})
+        if isinstance(first_selected_task, dict)
+        else {}
+    )
+    first_selected_continuity = (
+        str(first_selected_content.get("continuity_mode", "shot")).lower()
+        if isinstance(first_selected_content, dict)
+        else "shot"
+    )
+    if first_selected_continuity == "context_test":
+        first_selected_continuity = "context"
+    if (
+        first_selected_index > 0
+        and first_selected_continuity in H3_CONTEXT_CONTINUITY_MODES
+        and not is_passthrough
+        and not h3_task_is_passthrough(first_selected_entry)
+    ):
+        previous_index = first_selected_index - 1
+        if not has_h3_context_latent(
+            safe_project_name,
+            previous_index,
+            resolution="high",
+            output_directory=folder_paths.get_output_directory(),
+        ):
+            raise ValueError(
+                f"Cannot start segment {first_selected_index + 1} with "
+                f"{first_selected_continuity}: segment {previous_index + 1} "
+                "has no active context latent. Generate or restore the "
+                "previous segment first."
+            )
+        previous_is_passthrough = (
+            h3_active_segment_is_passthrough(
+                safe_project_name,
+                previous_index,
+                folder_paths.get_output_directory(),
+            )
+            if is_selflift else False
+        )
+        if is_selflift and not has_h3_context_latent(
+            safe_project_name,
+            previous_index,
+            resolution="low",
+            output_directory=folder_paths.get_output_directory(),
+            allow_low_fallback=previous_is_passthrough,
+        ):
+            raise ValueError(
+                f"Cannot start SelfLift segment {first_selected_index + 1} "
+                f"with {first_selected_continuity}: segment "
+                f"{previous_index + 1} has no active low-resolution context "
+                "latent. Regenerate the previous segment with SelfLift first."
+            )
+    resume_task_index: int | None = None
+    if run_second_pass and selected_entries:
+        first_selected_index = selected_entries[0][0]
+        if has_h3_first_pass_checkpoint(
+            safe_project_name,
+            first_selected_index,
+            folder_paths.get_output_directory(),
+        ):
+            resume_task_index = first_selected_index
+            log_node_info(
+                node_name,
+                f"Resuming segment {first_selected_index} from its first-pass checkpoint",
+            )
+
+    if project_save == "override" and segment_count == -1:
+        clear_h3_project_segments_from(
+            safe_project_name,
+            (
+                resume_task_index + 1
+                if resume_task_index is not None
+                else segment_start_index
+            ),
+            folder_paths.get_output_directory(),
+        )
+        report_step(19)
+
+    if first_pass_only and has_second_pass:
+        selected_entries = selected_entries[:1]
+    log_node_info(
+        node_name,
+        f"Found {len(all_entries)} segments; processing {len(selected_entries)}",
+    )
+    report_step(20)
+    first_pass_seed = int(_first_input(kwargs.get("seed"), 42))
+    second_pass_seed = first_pass_seed
+    selected_upscale_model = str(
+        _first_input(
+            sampling_config.get("upscale_model"),
+            _first_input(kwargs.get("upscale_model"), "None"),
+        )
+    )
+    if not uses_linked_prepare and audio_vae is None:
+        raise ValueError(
+            "model_loader must include audio_vae to decode MiniMax H3 audio."
+        )
+    report_step(25)
+
+    graph = GraphBuilder()
+    report_step(27)
+    preset_name = str(_first_input(kwargs.get("sampling_plan"), "medium"))
+    has_context_second_pass = run_second_pass and has_sampling_tasks and any(
+        task_index > 0 and isinstance(entry.get("task"), dict)
+        and not h3_task_is_passthrough(entry)
+        and isinstance(entry["task"].get("content"), dict)
+        and str(entry["task"]["content"].get("continuity_mode", "shot")).lower()
+        in H3_CONTEXT_CONTINUITY_MODES for task_index, entry in selected_entries
+    )
+    if uses_linked_prepare:
+        def raw_sampling_input(name: str) -> Any:
+            value = sampling_config.get(name)
+            return _raw_project_input(value if value is not None else kwargs.get(name))
+
+        tracks_info_link = _hidden_project_input_link(
+            hidden_inputs,
+            "tracks_info",
+        )
+        project_media_static = graph.node(
+            "easy h3ProjectStaticPrepare",
+            id="project_media_prepare",
+            tracks_info=tracks_info_link or info,
+        )
+        model_inputs = {
+            "model_loader": selected_model_loader,
+            "sampling_plan": preset_name,
+            "sampling_mode": sampling_mode if has_sampling_tasks else "passthrough",
+            "run_second_pass": run_second_pass and has_sampling_tasks,
+            "has_context_second_pass": has_context_second_pass,
+            "turbo_hint": first_is_turbo,
+        }
+        for name, value in (
+            ("model_loader_2nd", second_model_loader),
+            ("sampler", raw_sampling_input("sampler")),
+            ("sigmas", raw_sampling_input("sigmas")),
+            ("sampler_2nd", raw_sampling_input("sampler_2nd")),
+            ("sigmas_2nd", raw_sampling_input("sigmas_2nd")),
+        ):
+            if value is not None:
+                model_inputs[name] = value
+        project_model_static = graph.node(
+            "easy h3ProjectStaticPrepare",
+            id="project_model_prepare",
+            **model_inputs,
+        )
+        model, second_model = project_model_static.out(2), project_model_static.out(3)
+        clip, vae = project_model_static.out(4), project_model_static.out(5)
+        audio_vae, preview_vae = project_model_static.out(6), project_model_static.out(7)
+        full_locked_audio = project_media_static.out(8)
+        first_pass_sampler, first_pass_sigmas = project_model_static.out(9), project_model_static.out(10)
+        second_pass_sampler, second_pass_sigmas = project_model_static.out(11), project_model_static.out(12)
+        context_second_pass_sigmas = project_model_static.out(13)
+        task_tracks_info_base = shared_images = shared_audio = shared_video = None
+    else:
+        (task_tracks_info_base, shared_images, shared_audio, shared_video,
+         full_locked_audio) = prepare_multitrack_project_media(info)
+        first_pass_sampler = first_pass_sigmas = None
+        if has_sampling_tasks and any(
+            task_index != resume_task_index and not h3_task_is_passthrough(entry)
+            for task_index, entry in selected_entries
+        ):
+            if is_selflift:
+                first_pass_sigmas = _h3_resolve_selflift_sigmas(
+                    graph, sigmas=_first_input(kwargs.get("sigmas")),
+                    preset_name=preset_name, is_turbo=first_is_turbo)
+            else:
+                first_pass_sampler, first_pass_sigmas = _h3_resolve_pass_sampling(
+                    graph, pass_name="first_pass", sampler=_first_input(kwargs.get("sampler")),
+                    sigmas=_first_input(kwargs.get("sigmas")), preset_name=preset_name,
+                    has_second_pass=has_second_pass, is_turbo=first_is_turbo)
+        second_pass_sampler = second_pass_sigmas = context_second_pass_sigmas = None
+        if run_second_pass and has_sampling_tasks:
+            configured_sampler = _first_input(sampling_config.get("sampler_2nd"), _first_input(kwargs.get("sampler_2nd")))
+            configured_sigmas = _first_input(sampling_config.get("sigmas_2nd"), _first_input(kwargs.get("sigmas_2nd")))
+            custom_second = configured_sampler is not None or configured_sigmas is not None
+            second_pass_sampler, second_pass_sigmas = _h3_resolve_pass_sampling(
+                graph, pass_name="second_pass", sampler=configured_sampler,
+                sigmas=configured_sigmas, preset_name=preset_name,
+                has_second_pass=True, is_turbo=second_is_turbo)
+            if has_context_second_pass:
+                context_second_pass_sigmas = _h3_resolve_context_second_pass_sigmas(
+                    graph, preset_name=preset_name, is_turbo=second_is_turbo,
+                    has_custom_second_pass_sampling=custom_second)
+    report_step(31)
+
+    report_step(33)
+
+    previous_hires_context_latent: Any | None = None
+    previous_low_context_latent: Any | None = None
+    previous_reference_frame: Any | None = None
+    previous_artifact: Any | None = None
+    last_project_output: Any | None = None
+    report_step(35)
+
+    segment_total = len(selected_entries)
+    segment_nodes: dict[str, int] = {}
+    for segment_position, (task_index, entry) in enumerate(selected_entries):
+        previous_graph_nodes = set(graph.nodes)
+        def report_segment_step(
+            phase: float,
+            *,
+            current_position: int = segment_position,
+        ) -> None:
+            target = 35 + 60 * (current_position + phase) / segment_total
+            report_step(target)
+
+        task_type = h3_task_type(entry, info)
+        generation_mode = h3_generation_mode(task_type)
+        task = entry.get("task", {})
+        content = task.get("content", {}) if isinstance(task, dict) else {}
+        task_is_passthrough = is_passthrough or h3_task_is_passthrough(entry)
+        locked_audio_track = h3_locked_audio_track(entry, info)
+        locked_video_track = h3_locked_video_track(entry, info)
+        has_task_locked_audio = locked_audio_track is not None
+        preserve_source_timing = not audio_only and (
+            has_task_locked_audio or locked_video_track is not None
+        )
+        fit_locked_video_timing = (
+            preserve_source_timing
+            and locked_video_track is not None
+        )
+
+        ref_image_size = (
+            str(content.get("ref_image_size", "match")).lower()
+            if isinstance(content, dict)
+            else "match"
+        )
+        segment_lora_name = ""
+        segment_lora_strength = 1.0
+        if lora_resolver is not None and isinstance(content, dict):
+            resolved_lora = lora_resolver(content)
+            if resolved_lora is not None:
+                segment_lora_name, segment_lora_strength = resolved_lora
+        report_segment_step(0.0)
+        report_segment_step(0.04)
+        task_start_frame = max(0, int(entry.get("start_frame", 0)))
+        task_end_frame = max(
+            task_start_frame,
+            int(entry.get("end_frame", task_start_frame)),
+        )
+        task_duration_frames = max(1, task_end_frame - task_start_frame)
+        if uses_linked_prepare:
+            segment_static = graph.node(
+                "easy h3ProjectStaticPrepare", id=f"segment_static_prepare_{task_index}",
+                project_static=project_media_static.out(0), task_start_frame=task_start_frame,
+                task_index=task_index,
+                task_duration_frames=task_duration_frames, fps=fps,
+                generation_mode="reference" if task_is_passthrough else generation_mode,
+                **(
+                    {"previous": previous_artifact}
+                    if previous_artifact is not None
+                    else {}
+                ),
+            )
+            task_tracks_info, task_locked_audio = segment_static.out(1), segment_static.out(8)
+            task_output = graph.node(
+                "easy multiTrackTaskOutput",
+                id=f"task_{task_index}",
+                tracks_info=task_tracks_info,
+                task_index=task_index,
+                prompt_format="default",
+            )
+            base_task_length = task_output.out(3)
+            if preserve_source_timing:
+                base_task_length = task_duration_frames
+        else:
+            task_shared_audio, task_shared_video, task_locked_audio = crop_multitrack_project_media(
+                shared_audio, shared_video, full_locked_audio, task_start_frame,
+                task_duration_frames, fps,
+            )
+            task_tracks_info = prepare_multitrack_project_task_info(
+                task_tracks_info_base, shared_images,
+                task_shared_audio if generation_mode == "reference" or task_is_passthrough else [],
+                task_shared_video if generation_mode == "reference" or task_is_passthrough else [],
+                task_entry=entry,
+            )
+            task_output = graph.node(
+                "easy multiTrackTaskOutput", id=f"task_{task_index}",
+                tracks_info=task_tracks_info,
+                **({"previous": previous_artifact} if previous_artifact is not None else {}),
+                task_index=task_index, prompt_format="default",
+            )
+            base_task_length = task_output.out(3)
+            if preserve_source_timing:
+                base_task_length = task_duration_frames
+        if task_is_passthrough:
+            if audio_only:
+                raise ValueError("Passthrough requires a video project, not audio-only mode")
+            passthrough = graph.node(
+                "easy h3PassthroughVideo",
+                id=f"passthrough_video_{task_index}",
+                videos=task_output.out(6),
+                frame_count=task_duration_frames,
+                fps=fps,
+                width=target_width,
+                height=target_height,
+                project_name=safe_project_name,
+                segment_index=task_index,
+            )
+            context_latent = _h3_encode_context_media(
+                graph, passthrough.out(1), passthrough.out(2), vae, audio_vae,
+                f"passthrough_context_{task_index}",
+            )
+            runtime_context_latent = graph.node(
+                "easy h3MotionContextLatentTrim",
+                id=f"trim_hires_context_latent_{task_index}",
+                latent=context_latent,
+                context_length=str(H3_CONTEXT_SOURCE_FRAMES),
+            ).out(0)
+            saved_video_end = graph.node(
+                "easy h3SegmentSaveEnd",
+                id=f"save_end_{task_index}",
+                video_path=passthrough.out(0),
+                project_name=safe_project_name,
+                segment_index=task_index,
+            )
+            artifact_inputs = {
+                "project_name": safe_project_name,
+                "project_save": project_save,
+                "segment_index": task_index,
+                "context_latent": runtime_context_latent,
+                "video_path": saved_video_end.out(0),
+                "tracks_info": output_info,
+                "continuity_mode": "shot",
+                "seed": first_pass_seed,
+                "sampling_pass": "single",
+            }
+            if previous_artifact is not None:
+                artifact_inputs["previous"] = previous_artifact
+            artifact = graph.node(
+                "easy h3ProjectArtifact",
+                id=f"artifact_{task_index}",
+                **artifact_inputs,
+            )
+            previous_artifact = last_project_output = artifact.out(0)
+            previous_hires_context_latent = runtime_context_latent
+            previous_low_context_latent = runtime_context_latent
+            previous_reference_frame = passthrough.out(1)
+            segment_nodes.update({
+                node_id: task_index
+                for node_id in graph.nodes.keys() - previous_graph_nodes
+            })
+            report_segment_step(1.0)
+            continue
+        continuity_mode = (
+            str(content.get("continuity_mode", "shot")).lower()
+            if isinstance(content, dict)
+            else "shot"
+        )
+        if continuity_mode == "context_test":
+            continuity_mode = "context"
+        uses_context = continuity_mode in H3_CONTEXT_CONTINUITY_MODES
+        uses_swap = continuity_mode in {"context_drift", "context_swap"}
+        aligned_task_length: Any = (
+            minimax_frame_count(base_task_length, round_up=True)
+            if preserve_source_timing
+            else base_task_length
+        )
+        task_length: Any = aligned_task_length
+        will_have_context_continuity = (
+            uses_context
+            and (previous_hires_context_latent is not None or task_index > 0)
+        )
+        context_source_frames = H3_CONTEXT_SOURCE_FRAMES
+        context_generation_frames = 34
+        if will_have_context_continuity:
+            task_length = graph.node(
+                "ComfyMathExpression",
+                id=f"context_length_{task_index}",
+                expression=f"a + {context_generation_frames}",
+                **{"values.a": task_length},
+            ).out(1)
+        report_segment_step(0.10)
+        task_images = task_output.out(4)
+        if continuity_mode == "last_frame_ref" and generation_mode != "reference":
+            log_node_info(
+                node_name,
+                f"Segment {task_index}: last_frame_ref needs ref/edit task mode; "
+                "ignoring it, this segment has no motion continuity",
+            )
+        elif (
+            continuity_mode == "last_frame_ref"
+            and previous_reference_frame is not None
+        ):
+            task_images = graph.node(
+                "easy h3PreviousFrameReference",
+                id=f"previous_frame_reference_{task_index}",
+                images=task_images,
+                previous_video=previous_reference_frame,
+            ).out(0)
+        conditioning_inputs = {
+            "clip": clip, "vae": vae, "audio_vae": audio_vae,
+            "images": task_images, "prompt": task_output.out(1),
+            "mode": generation_mode,
+            "width": target_width if is_selflift else first_pass_width,
+            "height": target_height if is_selflift else first_pass_height,
+            "length": task_length, "ref_image_size": ref_image_size,
+        }
+        if generation_mode == "reference":
+            conditioning_inputs.update({
+                "audios": task_output.out(5),
+                "videos": task_output.out(6),
+            })
+            if fit_locked_video_timing:
+                conditioning_inputs["locked_video_timing_frames"] = (
+                    aligned_task_length
+                )
+        encoded_conditioning = graph.node(
+            "easy minimaxH3ToVideo",
+            id=f"conditioning_{task_index}",
+            **conditioning_inputs,
+        )
+        conditioning = graph.node(
+            "easy h3ConditioningCache",
+            id=f"conditioning_cache_{task_index}",
+            project_name=safe_project_name,
+            segment_index=task_index,
+            tracks_info=task_tracks_info,
+            task_output_ready=task_output.out(1),
+            model=model,
+            clip=clip,
+            vae=vae,
+            audio_vae=audio_vae,
+            conditioning=encoded_conditioning.out(0),
+            latent=encoded_conditioning.out(1),
+        )
+        base_positive = second_pass_positive = conditioning.out(0)
+        # Reference conditioning has no canvas-sized keyframes. Its text and
+        # media embeddings can be shared by both sampling resolutions.
+        if run_second_pass and generation_mode != "reference" and (
+            first_pass_width,
+            first_pass_height,
+        ) != (target_width, target_height):
+            second_inputs = {
+                **conditioning_inputs,
+                "width": target_width,
+                "height": target_height,
+            }
+            second_pass_positive = graph.node(
+                "easy minimaxH3ToVideo",
+                id=f"second_pass_conditioning_{task_index}",
+                **second_inputs,
+            ).out(0)
+        initial_latent = conditioning.out(1)
+        positive = base_positive
+
+        if (
+            uses_context
+            and previous_hires_context_latent is None
+            and task_index > 0
+        ):
+            report_segment_step(0.14)
+            loaded_hires_context = graph.node(
+                "easy h3ProjectContextLatentLoad",
+                id=f"load_hires_context_{task_index}",
+                project_name=safe_project_name,
+                segment_index=task_index - 1,
+                resolution="high",
+            )
+            previous_hires_context_latent = loaded_hires_context.out(0)
+            if has_second_pass or is_selflift:
+                loaded_low_context = graph.node(
+                    "easy h3ProjectContextLatentLoad",
+                    id=f"load_low_context_{task_index}",
+                    project_name=safe_project_name,
+                    segment_index=task_index - 1,
+                    resolution="low",
+                )
+                previous_low_context_latent = loaded_low_context.out(0)
+            else:
+                previous_low_context_latent = previous_hires_context_latent
+            report_segment_step(0.18)
+        context_trim_frames: Any | None = None
+        first_pass_context_trim_frames: Any | None = None
+        first_pass_context_latent = (
+            previous_low_context_latent
+            if has_second_pass
+            else previous_hires_context_latent
+        )
+        has_context_continuity = (
+            uses_context
+            and first_pass_context_latent is not None
+        )
+        # Lock task audio after the context source is known so its timeline
+        # can be shifted behind the copied source prefix. The extra 12
+        # generated frames required by H3's temporal grid are removed from
+        # the tail after decoding, not from the task's opening frames.
+        if has_task_locked_audio:
+            report_segment_step(0.20)
+            initial_latent = graph.node(
+                "easy minimaxH3AudioLock",
+                id=f"audio_lock_{task_index}",
+                latent=initial_latent,
+                audio_vae=audio_vae,
+                audio=task_locked_audio,
+                remix_strength=1.0,
+                short_audio_mode="silence",
+                prepend_frames=(
+                    context_source_frames if has_context_continuity else 0
+                ),
+                frame_rate=fps,
+            ).out(0)
+
+        segment_model = model
+        if segment_lora_name:
+            segment_model = graph.node(
+                "LoraLoaderModelOnly",
+                id=f"segment_lora_{task_index}",
+                model=model,
+                lora_name=segment_lora_name,
+                strength_model=segment_lora_strength,
+            ).out(0)
+        first_pass_sampling_model = segment_model
+        if has_context_continuity:
+            report_segment_step(0.22)
+            if uses_swap:
+                context_swap = graph.node(
+                    "easy MiniMaxH3ContextSwap",
+                    id=f"first_pass_context_swap_noise_{task_index}",
+                    model=segment_model,
+                    latent=initial_latent,
+                    context_latent=first_pass_context_latent,
+                    sigmas=first_pass_sigmas,
+                    context_length=str(context_source_frames),
+                    seed=(first_pass_seed + task_index) & 0xFFFFFFFFFFFFFFFF,
+                    continue_audio=True,
+                    freeze_audio=False,
+                )
+                first_pass_sampling_model = context_swap.out(0)
+                initial_latent = context_swap.out(1)
+                first_pass_context_trim_frames = context_swap.out(2)
+                context_trim_frames = first_pass_context_trim_frames
+            else:
+                motion_context = graph.node(
+                    "easy MiniMaxH3MotionContextHard",
+                    id=f"hard_motion_context_{task_index}",
+                    conditioning=positive,
+                    vae=vae,
+                    latent=initial_latent,
+                    context_latent=first_pass_context_latent,
+                    context_length=str(context_source_frames),
+                    video_transition_steps=4,
+                    audio_transition_steps=4,
+                    video_anchor_only=not audio_only,
+                )
+                positive = motion_context.out(0)
+                first_pass_context_trim_frames = motion_context.out(1)
+                context_trim_frames = first_pass_context_trim_frames
+                initial_latent = motion_context.out(2)
+        else:
+            report_segment_step(0.22)
+
+        report_segment_step(0.28)
+        selflift_low_latent: Any | None = None
+        if is_selflift:
+            report_segment_step(0.38)
+            selflift_inputs: dict[str, Any] = {
+                "model": first_pass_sampling_model,
+                "highres_model": (
+                    second_model
+                    if second_model_loader is not None
+                    else first_pass_sampling_model
+                ),
+                "positive": positive,
+                "vae": vae,
+                "latent_image": initial_latent,
+                "sigmas": first_pass_sigmas,
+                "seed": first_pass_seed,
+                "transition_ratio": transition_ratio,
+                "lowres_scale": lowres_scale,
+                "rho": 0.1 if has_context_continuity else 0.0,
+                "w_max": 0.7,
+                "w_min": 0.25,
+                "upscaler_model": selected_upscale_model,
+                "enabled_tiling": tiling_enabled,
+                "tile_count": tile_count,
+            }
+            if has_sampling_preview:
+                selflift_inputs.update({
+                    "preview_vae": preview_vae,
+                    "preview_node_id": preview_node_id,
+                    "generated_frame_count": task_length,
+                    "preview_fps": fps,
+                    "segment_index": task_index,
+                    "sampling_pass": "selflift",
+                })
+            if (
+                has_context_continuity
+                and previous_low_context_latent is not None
+            ):
+                selflift_inputs["low_context_latent"] = previous_low_context_latent
+            if previous_artifact is not None:
+                selflift_inputs["previous"] = previous_artifact
+            selflift_sample = graph.node(
+                "easy minimaxH3SelfLiftSampler",
+                id=f"selflift_sample_{task_index}",
+                **selflift_inputs,
+            )
+            first_pass_latent = selflift_sample.out(0)
+            selflift_low_latent = selflift_sample.out(1)
+        else:
+            first_pass_guider = graph.node(
+                "BasicGuider",
+                id=f"first_pass_guider_{task_index}",
+                model=first_pass_sampling_model,
+                conditioning=positive,
+            )
+            if task_index == resume_task_index:
+                report_segment_step(0.38)
+                first_pass_latent = graph.node(
+                    "easy h3ProjectContextLatentLoad",
+                    id=f"resume_first_pass_{task_index}",
+                    project_name=safe_project_name,
+                    segment_index=task_index,
+                ).out(0)
+            else:
+                report_segment_step(0.32)
+                first_pass_noise = graph.node(
+                    "RandomNoise",
+                    id=f"first_pass_noise_{task_index}",
+                    noise_seed=first_pass_seed,
+                )
+                report_segment_step(0.38)
+                sampling_inputs: dict[str, Any] = {
+                    "noise": first_pass_noise.out(0),
+                    "guider": first_pass_guider.out(0),
+                    "sampler": first_pass_sampler,
+                    "sigmas": first_pass_sigmas,
+                    "latent_image": initial_latent,
+                    "project_name": safe_project_name,
+                    "segment_index": task_index,
+                }
+                if previous_artifact is not None:
+                    sampling_inputs["previous"] = previous_artifact
+                sampling_start = graph.node(
+                    "easy h3SegmentSamplingStart",
+                    id=f"sampling_start_{task_index}",
+                    sampling_pass="first",
+                    **sampling_inputs,
+                )
+                preview_inputs = (
+                    {
+                        "preview_vae": preview_vae,
+                        "preview_node_id": preview_node_id,
+                        "generated_frame_count": task_length,
+                        "preview_fps": fps,
+                        "segment_index": task_index,
+                        "sampling_pass": "first",
+                    }
+                    if has_sampling_preview
+                    else {}
+                )
+                first_pass_sample = graph.node(
+                    "easy h3SamplingPreviewSampler"
+                    if has_sampling_preview
+                    else "SamplerCustomAdvanced",
+                    id=f"first_pass_sample_{task_index}",
+                    noise=sampling_start.out(0),
+                    guider=sampling_start.out(1),
+                    sampler=sampling_start.out(2),
+                    sigmas=sampling_start.out(3),
+                    latent_image=sampling_start.out(4),
+                    **preview_inputs,
+                )
+                first_pass_latent = first_pass_sample.out(1)
+        final_latent = first_pass_latent
+        report_segment_step(0.42)
+
+        if run_second_pass:
+            segment_second_pass_sigmas = second_pass_sigmas
+            if (
+                uses_context
+                and previous_hires_context_latent is not None
+                and context_second_pass_sigmas is not None
+            ):
+                segment_second_pass_sigmas = context_second_pass_sigmas
+            if audio_only or upscale_by <= 1:
+                report_segment_step(0.46)
+                upscaled_latent = final_latent
+            else:
+                report_segment_step(0.45)
+                separated = graph.node(
+                    "LTXVSeparateAVLatent",
+                    id=f"separate_first_pass_{task_index}",
+                    av_latent=final_latent,
+                )
+                if selected_upscale_model != "None":
+                    report_segment_step(0.50)
+                    upscaled_video = graph.node(
+                        "easy minimaxH3LatentUpscaler",
+                        id=f"latent_upscale_{task_index}",
+                        **_h3_latent_upscale_inputs(
+                            separated.out(0),
+                            selected_upscale_model,
+                            target_width,
+                            target_height
+                        ),
+                    )
+                    video_latent = upscaled_video.out(0)
+                else:
+                    report_segment_step(0.48)
+                    first_pass_images = graph.node(
+                        "VAEDecode",
+                        id=f"first_pass_decode_{task_index}",
+                        samples=separated.out(0),
+                        vae=vae,
+                    )
+                    report_segment_step(0.51)
+                    resized = graph.node(
+                        "ImageResizeKJv2",
+                        id=f"first_pass_resize_{task_index}",
+                        **_h3_image_resize_inputs(
+                            first_pass_images.out(0),
+                            target_width,
+                            target_height,
+                        ),
+                    )
+                    report_segment_step(0.54)
+                    encoded_video = graph.node(
+                        "VAEEncode",
+                        id=f"first_pass_reencode_{task_index}",
+                        pixels=resized.out(0),
+                        vae=vae,
+                    )
+                    video_latent = encoded_video.out(0)
+
+                report_segment_step(0.57)
+                upscaled_latent = graph.node(
+                    "LTXVConcatAVLatent",
+                    id=f"first_pass_recombine_{task_index}",
+                    video_latent=video_latent,
+                    audio_latent=separated.out(1),
+                ).out(0)
+
+            second_pass_sampling_model = second_model
+            if (
+                uses_context
+                and previous_hires_context_latent is not None
+            ):
+                report_segment_step(0.59)
+                # Second pass is deliberately kept as an ordinary hi-res refine path.
+                # No context noise, no split-prior, and no Drift-Control patching here.
+                hires_continuity = graph.node(
+                    "easy MiniMaxH3HiResContinuity",
+                    id=f"hires_continuity_{task_index}",
+                    current_hires_latent=upscaled_latent,
+                    previous_hires_latent=previous_hires_context_latent,
+                    context_length=str(H3_CONTEXT_SOURCE_FRAMES),
+                    video_transition_steps=4,
+                    video_anchor_only=not audio_only,
+                )
+                upscaled_latent = hires_continuity.out(0)
+                context_trim_frames = hires_continuity.out(1)
+
+            report_segment_step(0.62)
+            second_pass_noise = graph.node(
+                "DisableNoise" if disable_2nd_noise else "RandomNoise",
+                id=f"second_pass_noise_{task_index}",
+                **({} if disable_2nd_noise else {"noise_seed": second_pass_seed}),
+            )
+            report_segment_step(0.66)
+            second_pass_guider = graph.node(
+                "BasicGuider",
+                id=f"second_pass_guider_{task_index}",
+                model=second_pass_sampling_model,
+                conditioning=second_pass_positive,
+            )
+            report_segment_step(0.71)
+            second_sampling_start = graph.node(
+                "easy h3SegmentSamplingStart",
+                id=f"second_sampling_start_{task_index}",
+                noise=second_pass_noise.out(0),
+                guider=second_pass_guider.out(0),
+                sampler=second_pass_sampler,
+                sigmas=segment_second_pass_sigmas,
+                latent_image=upscaled_latent,
+                project_name=safe_project_name,
+                segment_index=task_index,
+                sampling_pass="second",
+            )
+            second_preview_inputs = (
+                {
+                    "preview_vae": preview_vae,
+                    "preview_node_id": preview_node_id,
+                    "generated_frame_count": task_length,
+                    "preview_fps": fps,
+                    "segment_index": task_index,
+                    "sampling_pass": "second",
+                }
+                if has_sampling_preview
+                else {}
+            )
+            if tiling_enabled:
+                second_preview_inputs.update({
+                    "enabled_tiling": True,
+                    "tile_count": tile_count,
+                })
+            second_pass_sample = graph.node(
+                "easy h3SamplingPreviewSampler"
+                if has_sampling_preview or tiling_enabled
+                else "SamplerCustomAdvanced",
+                id=f"second_pass_sample_{task_index}",
+                noise=second_sampling_start.out(0),
+                guider=second_sampling_start.out(1),
+                sampler=second_sampling_start.out(2),
+                sigmas=second_sampling_start.out(3),
+                latent_image=second_sampling_start.out(4),
+                **second_preview_inputs,
+            )
+            final_latent = second_pass_sample.out(1)
+        else:
+            report_segment_step(0.71)
+
+        low_stage_context_latent = (
+            selflift_low_latent
+            if is_selflift and selflift_low_latent is not None
+            else first_pass_latent
+            if has_second_pass
+            else final_latent
+        )
+        hires_context_reencoded = False
+        low_context_reencoded = False
+        if audio_only:
+            output_audio = graph.node(
+                "VAEDecodeAudio",
+                id=f"decode_audio_{task_index}",
+                samples=final_latent,
+                vae=audio_vae,
+            ).out(0)
+            project_hires_context_latent = final_latent
+            project_low_context_latent = low_stage_context_latent
+            if context_trim_frames is not None:
+                output_audio, project_hires_context_latent = _h3_encode_audio_context(
+                    graph, output_audio, audio_vae, context_trim_frames,
+                    base_task_length, fps, not has_task_locked_audio,
+                    f"hires_audio_context_{task_index}",
+                )
+                if (has_second_pass and run_second_pass) or (
+                    is_selflift and selflift_low_latent is not None
+                ):
+                    low_audio = graph.node(
+                        "VAEDecodeAudio", id=f"low_audio_context_decode_{task_index}",
+                        samples=low_stage_context_latent, vae=audio_vae,
+                    ).out(0)
+                    _, project_low_context_latent = _h3_encode_audio_context(
+                        graph, low_audio, audio_vae, first_pass_context_trim_frames,
+                        base_task_length, fps, not has_task_locked_audio,
+                        f"low_audio_context_{task_index}",
+                    )
+                else:
+                    project_low_context_latent = project_hires_context_latent
+
+            report_segment_step(0.89)
+            saved_audio = output_audio
+            if has_task_locked_audio:
+                saved_audio = graph.node(
+                    "easy h3LockedAudioSelect",
+                    id=f"locked_audio_select_{task_index}",
+                    generated_audio=output_audio,
+                    locked_audio=task_locked_audio,
+                ).out(0)
+            saved_media_inputs = {
+                "audio": saved_audio,
+            }
+        else:
+            report_segment_step(0.76)
+            decoded_images = graph.node(
+                "VAEDecode",
+                id=f"decode_video_{task_index}",
+                samples=final_latent,
+                vae=vae,
+            )
+            report_segment_step(0.80)
+            decoded_audio = graph.node(
+                "VAEDecodeAudio",
+                id=f"decode_audio_{task_index}",
+                samples=final_latent,
+                vae=audio_vae,
+            )
+            output_images = decoded_images.out(0)
+            output_audio = decoded_audio.out(0)
+            if context_trim_frames is not None or preserve_source_timing:
+                report_segment_step(0.84)
+                trimmed = graph.node(
+                    "easy h3ContextMediaTrim",
+                    id=f"motion_context_trim_{task_index}",
+                    images=output_images,
+                    audio=output_audio,
+                    trim_frames=(
+                        context_trim_frames if context_trim_frames is not None else 0
+                    ),
+                    output_frames=base_task_length,
+                    pad_audio=not has_task_locked_audio,
+                    **(
+                        {"fit_video_duration": True}
+                        if fit_locked_video_timing
+                        else {}
+                    ),
+                    fps=fps,
+                )
+                output_images = trimmed.out(0)
+                output_audio = trimmed.out(1)
+            else:
+                report_segment_step(0.84)
+
+            if has_task_locked_audio:
+                locked_audio_align = graph.node(
+                    "easy h3LockedAudioDurationAlign",
+                    id=f"locked_audio_duration_align_{task_index}",
+                    images=output_images,
+                    audio=output_audio,
+                    fps=fps,
+                )
+                output_audio = locked_audio_align.out(0)
+
+            saved_audio = output_audio
+            if has_task_locked_audio:
+                saved_audio = graph.node(
+                    "easy h3LockedAudioSelect",
+                    id=f"locked_audio_select_{task_index}",
+                    generated_audio=output_audio,
+                    locked_audio=task_locked_audio,
+                ).out(0)
+
+            project_hires_context_latent = final_latent
+            project_low_context_latent = low_stage_context_latent
+            low_delivered_images: Any | None = None
+            if context_trim_frames is not None or preserve_source_timing:
+                # Rebuild continuity from the delivered span after removing
+                # the optional context head and temporal-grid tail.
+                project_hires_context_latent = _h3_encode_context_media(
+                    graph,
+                    output_images,
+                    output_audio,
+                    vae,
+                    audio_vae,
+                    f"hires_context_{task_index}",
+                )
+                hires_context_reencoded = True
+                if (has_second_pass and run_second_pass) or (
+                    is_selflift and selflift_low_latent is not None
+                ):
+                    low_context_images = graph.node(
+                        "VAEDecode",
+                        id=f"low_context_video_decode_{task_index}",
+                        samples=low_stage_context_latent,
+                        vae=vae,
+                    )
+                    low_context_audio = graph.node(
+                        "VAEDecodeAudio",
+                        id=f"low_context_audio_decode_{task_index}",
+                        samples=low_stage_context_latent,
+                        vae=audio_vae,
+                    )
+                    low_context_media = graph.node(
+                        "easy h3ContextMediaTrim",
+                        id=f"low_context_trim_{task_index}",
+                        images=low_context_images.out(0),
+                        audio=low_context_audio.out(0),
+                        trim_frames=(
+                            first_pass_context_trim_frames
+                            if first_pass_context_trim_frames is not None
+                            else 0
+                        ),
+                        output_frames=base_task_length,
+                        **(
+                            {"fit_video_duration": True}
+                            if fit_locked_video_timing
+                            else {}
+                        ),
+                        fps=fps,
+                    )
+                    low_delivered_images = low_context_media.out(0)
+                    project_low_context_latent = _h3_encode_context_media(
+                        graph,
+                        low_context_media.out(0),
+                        low_context_media.out(1),
+                        vae,
+                        audio_vae,
+                        f"low_context_{task_index}",
+                    )
+                    low_context_reencoded = True
+                else:
+                    project_low_context_latent = project_hires_context_latent
+                    low_context_reencoded = hires_context_reencoded
+            report_segment_step(0.89)
+            # Keep decoded audio for latent continuity, but deliver the original
+            # task audio in the video so the project needs no separate WAV.
+            saved_video = graph.node(
+                "easy saveVideo",
+                id=f"save_video_{task_index}",
+                input_mode="images+audio",
+                **{
+                    "input_mode.images": output_images,
+                    "input_mode.audio": saved_audio,
+                    "input_mode.fps": fps,
+                    "output_mode": "hide&save",
+                },
+                filename_prefix=(
+                    f"easy_media/projects/{safe_project_name}/"
+                    f".staging_video_{task_index}"
+                ),
+            )
+            saved_video_end = graph.node(
+                "easy h3SegmentSaveEnd",
+                id=f"save_end_{task_index}",
+                video_path=saved_video.out(1),
+                project_name=safe_project_name,
+                segment_index=task_index,
+            )
+            saved_media_inputs = {"video_path": saved_video_end.out(0)}
+
+        previous_reference_frame = output_images if not audio_only else None
+        saved_hires_context_latent = project_hires_context_latent
+        saved_low_context_latent = project_low_context_latent
+        hires_trim_inputs: dict[str, Any] = {
+            "latent": saved_hires_context_latent,
+            "context_length": str(context_source_frames),
+        }
+        if not audio_only and not hires_context_reencoded:
+            hires_trim_inputs.update({"anchor_images": output_images, "vae": vae})
+        runtime_hires_context_latent = graph.node(
+            "easy h3MotionContextLatentTrim",
+            id=f"trim_hires_context_latent_{task_index}",
+            **hires_trim_inputs,
+        ).out(0)
+        if has_second_pass or is_selflift:
+            low_trim_inputs: dict[str, Any] = {
+                "latent": saved_low_context_latent,
+                "context_length": str(context_source_frames),
+            }
+            if not audio_only and not low_context_reencoded:
+                low_anchor_images = low_delivered_images
+                if low_anchor_images is None:
+                    if (has_second_pass and run_second_pass) or (
+                        is_selflift and selflift_low_latent is not None
+                    ):
+                        low_anchor_images = graph.node(
+                            "VAEDecode",
+                            id=f"low_anchor_decode_video_{task_index}",
+                            samples=low_stage_context_latent,
+                            vae=vae,
+                        ).out(0)
+                    else:
+                        low_anchor_images = output_images
+                low_trim_inputs.update(
+                    {"anchor_images": low_anchor_images, "vae": vae}
+                )
+            runtime_low_context_latent = graph.node(
+                "easy h3MotionContextLatentTrim",
+                id=f"trim_low_context_latent_{task_index}",
+                **low_trim_inputs,
+            ).out(0)
+        else:
+            runtime_low_context_latent = runtime_hires_context_latent
+        completed_sampling_pass = (
+            "first"
+            if first_pass_only and has_second_pass
+            else "second"
+            if has_second_pass
+            else "single"
+        )
+        # A pass-two resume needs the full sampled span, while continuity
+        # uses the re-encoded delivered span (also saved as low context).
+        checkpoint_latent = (
+            first_pass_latent if preserve_source_timing else saved_hires_context_latent
+        )
+        artifact_inputs: dict[str, Any] = {
+            "project_name": safe_project_name,
+            "project_save": project_save,
+            "segment_index": task_index,
+            "context_latent": (
+                checkpoint_latent
+                if completed_sampling_pass == "first"
+                else runtime_hires_context_latent
+            ),
+            **saved_media_inputs,
+            "tracks_info": output_info,
+            "continuity_mode": continuity_mode,
+            "seed": first_pass_seed,
+            "sampling_pass": completed_sampling_pass,
+        }
+        if has_second_pass or is_selflift:
+            artifact_inputs["context_latent_low"] = (
+                saved_low_context_latent
+                if completed_sampling_pass == "first"
+                else runtime_low_context_latent
+            )
+        if previous_artifact is not None:
+            artifact_inputs["previous"] = previous_artifact
+        report_segment_step(0.95)
+        artifact = graph.node(
+            "easy h3ProjectArtifact",
+            id=f"artifact_{task_index}",
+            **artifact_inputs,
+        )
+        previous_artifact = artifact.out(0)
+        last_project_output = artifact.out(0)
+        previous_hires_context_latent = runtime_hires_context_latent
+        previous_low_context_latent = runtime_low_context_latent
+        segment_nodes.update({
+            node_id: task_index
+            for node_id in graph.nodes.keys() - previous_graph_nodes
+        })
+        report_segment_step(1.0)
+
+    if last_project_output is None:
+        log_node_info(node_name, "Project graph produced no task output")
+        raise RuntimeError("H3 project graph produced no task output")
+    report_step(100)
+    return io.NodeOutput(
+        last_project_output,
+        full_locked_audio,
+        expand=_timed_h3_project_graph(graph, safe_project_name, segment_nodes),
+    )
+
+
 class EasyMultiTrackProject(io.ComfyNode):
     @classmethod
     def _sampling_plan_options(cls) -> list[str]:
@@ -1036,1278 +2346,550 @@ class EasyMultiTrackProject(io.ComfyNode):
 
     @classmethod
     def execute(cls, **kwargs: Any) -> io.NodeOutput:
-        node_name = "MultiTrack Project"
-        progress_total = 100
-        progress_bar = ProgressBar(progress_total)
-        progress_value = 0
+        return _execute_h3_project_core(cls, **kwargs)
 
-        def report_step(target: float) -> None:
-            nonlocal progress_value
-            progress_value = max(
-                progress_value,
-                min(progress_total, int(round(target))),
-            )
-            progress_bar.update_absolute(progress_value, progress_total)
 
-        report_step(0)
-        selected_model_loader = _raw_project_input(kwargs.get("model_loader"))
-        uses_linked_prepare = is_link(selected_model_loader)
-        if not uses_linked_prepare and not isinstance(selected_model_loader, dict):
-            raise TypeError("model_loader must contain a FAST_MODEL_LOADER dictionary.")
+_SCENE_STUDIO_PROJECT_INPUT_NAMES = (
+    "model_loader",
+    "model_loader_2nd",
+    "sampler",
+    "sampler_2nd",
+    "sigmas",
+    "sigmas_2nd",
+    "project_name",
+    "project_save",
+    "segment_start_number",
+    "segment_count",
+    "seed",
+    "sampling_plan",
+    "sampling_mode",
+    "1st_pass_only",
+    "disable_2nd_noise",
+    "upscale_by",
+    "upscale_model",
+    "enabled_tiling",
+)
 
-        model = None if uses_linked_prepare else selected_model_loader.get("model")
-        clip = None if uses_linked_prepare else selected_model_loader.get("clip")
-        vae = None if uses_linked_prepare else selected_model_loader.get("vae")
-        audio_vae = None if uses_linked_prepare else selected_model_loader.get("audio_vae")
-        preview_vae = None if uses_linked_prepare else selected_model_loader.get("preview_vae")
-        preview_node_id = str(
-            _first_input(
-                getattr(getattr(cls, "hidden", None), "unique_id", None),
-                "",
-            )
+
+def _scene_studio_lora_resolver(content: dict) -> tuple[str, float] | None:
+    """Resolve a segment's optional per-segment LoRA, ignoring unknown filenames."""
+    lora_name = content.get("lora_name")
+    if not isinstance(lora_name, str) or not lora_name:
+        return None
+    if lora_name not in folder_paths.get_filename_list("loras"):
+        return None
+    try:
+        strength = float(content.get("lora_strength", 1.0))
+    except (TypeError, ValueError):
+        strength = 1.0
+    return lora_name, strength
+
+
+def _scene_studio_render(cls, *, tracks_info: dict, **project_kwargs: Any) -> io.NodeOutput:
+    """Run the shared project core with Scene Studio's LoRA resolver."""
+    return _execute_h3_project_core(
+        cls,
+        lora_resolver=_scene_studio_lora_resolver,
+        tracks_info=tracks_info,
+        **project_kwargs,
+    )
+
+
+_SCENE_STUDIO_RAW_LINK_INPUT_NAMES = (
+    "model_loader",
+    "model_loader_2nd",
+    "sampler",
+    "sampler_2nd",
+    "sigmas",
+    "sigmas_2nd",
+)
+
+
+def _scene_studio_apply_graph_inputs(project_kwargs: dict) -> dict:
+    """Unwrap list-wrapped raw links so GraphBuilder wires them as real graph
+    connections instead of embedding them as opaque literal values."""
+    normalized = dict(project_kwargs)
+    for name in _SCENE_STUDIO_RAW_LINK_INPUT_NAMES:
+        if name in normalized:
+            normalized[name] = _raw_project_input(normalized[name])
+    return normalized
+
+
+class EasySceneStudio(io.ComfyNode):
+    """Combine MultiTrack Editor and MultiTrack Project into one node with named
+    scene save/load, per-segment LoRA, and a built-in run-triggered prompt
+    enhancer. Purely additive: MultiTrackEditor and EasyMultiTrackProject keep
+    their current behavior unchanged for existing workflows."""
+
+    @classmethod
+    def _sampling_plan_options(cls) -> list[str]:
+        return get_h3_preset_keys()
+
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="easy sceneStudio",
+            display_name="Scene Studio",
+            category=CATEGORY_MULTITRACK,
+            description=(
+                "Author a named scene timeline and render it through MiniMax H3 "
+                "in one node: named scene save/load, per-segment LoRA, a "
+                "run-triggered prompt enhancer, and single-segment rendering "
+                "for iterative building."
+            ),
+            is_input_list=True,
+            enable_expand=True,
+            not_idempotent=True,
+            inputs=[
+                io.DynamicCombo.Input(
+                    "resolution",
+                    options=resolution_combo_options,
+                    tooltip="Select a resolution or choose 'Custom'. Width and height of 32 enable audio-only output.",
+                ),
+                io.Combo.Input(
+                    "format",
+                    options=list(VIDEO_FORMATS.keys()),
+                    default="Wan",
+                    tooltip="Choose a video format to automatically set resolution and frame rate.",
+                ),
+                TYPE_TRACK_DATA.Input("track_data"),
+                io.AnyType.Input(
+                    "prompt_override",
+                    optional=True,
+                    tooltip="If provided, overrides all segment prompts in the timeline.",
+                ),
+                io.Image.Input("image", optional=True, lazy=True, tooltip="Optional image media list for slot-based multitrack segments."),
+                io.Audio.Input("audio", optional=True, lazy=True, tooltip="Optional audio media list for slot-based multitrack segments."),
+                io.Video.Input("video", optional=True, lazy=True, tooltip="Optional video media list for slot-based multitrack segments."),
+                io.String.Input(
+                    "scene_name",
+                    default="",
+                    tooltip="Name used to save this timeline as a scene.",
+                ),
+                io.Combo.Input(
+                    "scene_action",
+                    options=["none", "save"],
+                    default="none",
+                    tooltip="Set to 'save' to persist the current track_data under scene_name when this node runs.",
+                ),
+                TYPE_FAST_MODEL_LOADER.Input(
+                    "model_loader", raw_link=True, lazy=True,
+                ),
+                TYPE_FAST_MODEL_LOADER.Input(
+                    "model_loader_2nd",
+                    optional=True,
+                    raw_link=True,
+                    lazy=True,
+                    tooltip=(
+                        "Optional second-pass model for Dual sampling or the "
+                        "high-resolution SelfLift stage. Encoding and VAE "
+                        "components remain from the first-pass loader."
+                    ),
+                ),
+                io.Sampler.Input(
+                    "sampler", optional=True, raw_link=True, lazy=True,
+                ),
+                io.Sampler.Input("sampler_2nd", optional=True, raw_link=True, lazy=True, tooltip=(
+                    "Optional second-pass sampler. "
+                )),
+                io.Sigmas.Input(
+                    "sigmas", optional=True, raw_link=True, lazy=True,
+                ),
+                io.Sigmas.Input("sigmas_2nd", optional=True, raw_link=True, lazy=True, tooltip=(
+                    "Optional second-pass sigmas. "
+                )),
+                io.String.Input("project_name", default=""),
+                io.Combo.Input(
+                    "project_save",
+                    options=["new", "override"],
+                    default="override",
+                ),
+                io.Int.Input(
+                    "segment_start_number",
+                    default=1,
+                    min=1,
+                    max=0x7FFFFFFF,
+                    step=1,
+                    tooltip="The task segment start number."
+                ),
+                io.Int.Input(
+                    "segment_count",
+                    default=-1,
+                    min=-1,
+                    max=0x7FFFFFFF,
+                    step=1,
+                    tooltip=(
+                        "Maximum task segments in this queue. When set to -1, "
+                        "override mode deletes saved segments from "
+                        "segment_start_number onward before regeneration; new "
+                        "mode preserves existing video and latent files. Set to "
+                        "1 to render a single segment while iterating."
+                    ),
+                ),
+                io.Int.Input(
+                    "seed",
+                    default=42,
+                    min=0,
+                    max=0xFFFFFFFFFFFFFFFF,
+                    step=1,
+                    control_after_generate=io.ControlAfterGenerate.fixed,
+                ),
+                io.Combo.Input(
+                    "sampling_plan",
+                    options=cls._sampling_plan_options(),
+                    default="light",
+                ),
+                io.DynamicCombo.Input(
+                    "sampling_mode",
+                    options=[
+                        io.DynamicCombo.Option("single", []),
+                        io.DynamicCombo.Option("dual", []),
+                        io.DynamicCombo.Option(
+                            "selflift",
+                            [
+                                io.Float.Input(
+                                    "transition_ratio",
+                                    default=0.6,
+                                    min=0.05,
+                                    max=0.95,
+                                    step=0.05,
+                                    tooltip=(
+                                        "Fraction of denoiser evaluations performed "
+                                        "at low resolution."
+                                    ),
+                                ),
+                                io.Float.Input(
+                                    "lowres_scale",
+                                    default=0.6,
+                                    min=0.25,
+                                    max=1.0,
+                                    step=0.001,
+                                    round=0.001,
+                                    extra_dict={"precision": 3},
+                                    tooltip=(
+                                        "Scale of the low-resolution prefix relative "
+                                        "to the target latent."
+                                    ),
+                                ),
+                            ],
+                        ),
+                        io.DynamicCombo.Option("passthrough", []),
+                    ],
+                ),
+                io.Boolean.Input(
+                    "1st_pass_only",
+                    default=False,
+                    tooltip=(
+                        "Run and save only the first selected segment's "
+                        "first pass. Turn this off on the next run to "
+                        "resume directly from that checkpoint at pass two."
+                    ),
+                ),
+                io.Boolean.Input("disable_2nd_noise", default=False, tooltip="Disable noise in second-pass for dual-sampling"),
+                io.Float.Input(
+                    "upscale_by",
+                    default=1.250,
+                    min=1.0,
+                    max=8.0,
+                    step=0.001,
+                    round=0.001,
+                    extra_dict={"precision": 3},
+                ),
+                io.Combo.Input(
+                    "upscale_model",
+                    options=["None"]
+                    + folder_paths.get_filename_list("latent_upscale_models"),
+                    default="None",
+                ),
+                io.DynamicCombo.Input(
+                    "enabled_tiling",
+                    options=[
+                        io.DynamicCombo.Option("false", []),
+                        io.DynamicCombo.Option(
+                            "true",
+                            [
+                                io.Int.Input(
+                                    "tile_count",
+                                    default=2,
+                                    min=2,
+                                    max=8,
+                                    step=1,
+                                    tooltip="Spatial tile count shared by Dual and SelfLift high-res sampling.",
+                                ),
+                            ],
+                        ),
+                    ],
+                    tooltip="Enable shared high-resolution H3 spatial tiling.",
+                ),
+                io.Boolean.Input(
+                    "enhancer_enabled",
+                    default=False,
+                    tooltip=(
+                        "Enhance every segment's user_prompt into enhanced_prompt "
+                        "before rendering. Runs only when this node executes."
+                    ),
+                ),
+                TYPE_LLAMACPP_MODEL.Input(
+                    "llama_model",
+                    optional=True,
+                    lazy=True,
+                    raw_link=True,
+                    tooltip=(
+                        "Local llama.cpp model input; evaluated only when the "
+                        "local provider is selected and enhancer_enabled is on."
+                    ),
+                ),
+                io.DynamicCombo.Input(
+                    "model",
+                    options=MultiTrackPromptEnhancer._model_options(
+                        force_synchronous=True,
+                    ),
+                    tooltip="Provider and model used to enhance every segment prompt.",
+                ),
+                io.Int.Input(
+                    "enhancer_seed",
+                    default=0,
+                    min=0,
+                    max=0xFFFFFFFFFFFFFFFF,
+                    control_after_generate=True,
+                    tooltip="ComfyUI generation seed used for prompt enhancement.",
+                ),
+                TYPE_PROMPT_ENHANCER_ACCOUNT.Input(
+                    "api_account",
+                    tooltip=(
+                        "Provider balance and API key management. This widget is "
+                        "for account status only and does not affect enhancement."
+                    ),
+                ),
+            ],
+            hidden=[io.Hidden.prompt, io.Hidden.unique_id],
+            outputs=[
+                TYPE_TRACKS_INFO.Output("TRACKS_INFO"),
+                io.Image.Output("IMAGES", is_output_list=True),
+                io.Audio.Output("AUDIO", is_output_list=True),
+                io.Video.Output("VIDEO", is_output_list=True),
+                io.String.Output("PROJECT_NAME"),
+                io.Audio.Output("LOCKED_AUDIO"),
+            ],
         )
-        has_sampling_preview = bool(preview_node_id) and (uses_linked_prepare or preview_vae is not None)
-        missing_components = [] if uses_linked_prepare else [
+
+    @classmethod
+    def check_lazy_status(cls, **kwargs: object) -> list[str]:
+        editor_missing = MultiTrackEditor.check_lazy_status(
+            resolution=kwargs.get("resolution"),
+            format=kwargs.get("format"),
+            track_data=kwargs.get("track_data"),
+            prompt_override=kwargs.get("prompt_override"),
+            image=kwargs.get("image"),
+            audio=kwargs.get("audio"),
+            video=kwargs.get("video"),
+        )
+        other_missing = [
             name
-            for name, value in (("model", model), ("clip", clip), ("vae", vae))
-            if value is None
+            for name, value in kwargs.items()
+            if name not in ("image", "audio", "video") and value is None
         ]
-        if missing_components:
-            raise ValueError(
-                "model_loader is missing required components: "
-                + ", ".join(missing_components)
-            )
-        if not uses_linked_prepare:
-            _require_minimax_h3_model(model)
-        info = parse_tracks_info(kwargs.get("tracks_info"))
-        hidden_inputs = getattr(cls, "hidden", None)
-        validate_h3_project_outputs(
-            info,
-            getattr(hidden_inputs, "prompt", None),
-            getattr(hidden_inputs, "unique_id", None),
-        )
-        report_step(5)
+        return sorted(set(editor_missing) | set(other_missing))
 
-        sampling_mode, sampling_config = _h3_sampling_mode_config(
-            kwargs.get("sampling_mode")
+    @classmethod
+    def execute(cls, **kwargs: Any) -> io.NodeOutput:
+        editor_output = MultiTrackEditor.execute(
+            resolution=kwargs.get("resolution"),
+            format=kwargs.get("format"),
+            track_data=kwargs.get("track_data"),
+            prompt_override=kwargs.get("prompt_override"),
+            image=kwargs.get("image"),
+            audio=kwargs.get("audio"),
+            video=kwargs.get("video"),
         )
-        is_passthrough = sampling_mode == "passthrough"
-        is_selflift = sampling_mode == "selflift"
-        has_second_pass = sampling_mode == "dual"
-        transition_ratio = 0.6
-        lowres_scale = 0.6
-        tiling_enabled, tile_count = _h3_tiling_config(kwargs.get("enabled_tiling"))
-        if is_selflift:
-            transition_ratio = float(
-                _first_input(sampling_config.get("transition_ratio"), 0.6)
-            )
-            lowres_scale = float(
-                _first_input(sampling_config.get("lowres_scale"), 0.6)
-            )
-            legacy_highres_tiling = bool(
-                _first_input(sampling_config.get("highres_tiling"), False)
-            )
-            if legacy_highres_tiling and not tiling_enabled:
-                tiling_enabled = True
-                tile_count = 0
-        first_pass_only = bool(
-            _first_input(
-                sampling_config.get("1st_pass_only"),
-                _first_input(kwargs.get("1st_pass_only"), False),
-            )
-        )
-        run_second_pass = has_second_pass and not first_pass_only
-        if is_selflift:
-            first_pass_only = False
-        disable_2nd_noise = bool(
-            _first_input(
-                sampling_config.get("disable_2nd_noise"),
-                _first_input(kwargs.get("disable_2nd_noise"), False),
-            )
-        )
-        second_model = model
-        second_model_loader = None
-        if run_second_pass or is_selflift:
-            configured_second_loader = sampling_config.get("model_loader_2nd")
-            second_model_loader = _raw_project_input(
-                configured_second_loader if configured_second_loader is not None
-                else kwargs.get("model_loader_2nd")
-            )
-            if not uses_linked_prepare:
-                second_model = _h3_second_pass_model(second_model_loader, model=model)
-                _require_minimax_h3_model(second_model)
-        report_step(10)
+        tracks_info, images_out, audio_out, video_out = editor_output[0:4]
 
-        hidden_inputs = getattr(cls, "hidden", None)
-        prompt_turbo_detection = None
-        turbo_detection = None if uses_linked_prepare else detect_turbo_model(model)
-        if uses_linked_prepare or not turbo_detection.is_turbo:
-            prompt_turbo_detection = detect_turbo_lora_from_prompt(
-                getattr(hidden_inputs, "prompt", None),
-                getattr(hidden_inputs, "unique_id", None),
-            )
-            if uses_linked_prepare or prompt_turbo_detection is not None:
-                turbo_detection = prompt_turbo_detection
-        first_is_turbo = bool(turbo_detection and turbo_detection.is_turbo)
-        report_step(15)
-        second_turbo_detection = turbo_detection
-        if run_second_pass and not uses_linked_prepare and second_model is not model:
-            second_turbo_detection = detect_turbo_model(second_model)
-            report_step(16)
-        second_is_turbo = bool(second_turbo_detection and second_turbo_detection.is_turbo)
+        scene_action = str(_unwrap_list_scalar(kwargs.get("scene_action"), "none")).lower()
+        scene_name = str(_unwrap_list_scalar(kwargs.get("scene_name"), "")).strip()
+        if scene_action == "save" and scene_name:
+            raw_track_data = _unwrap_list_scalar(kwargs.get("track_data"), {})
+            save_scene(scene_name, _parse_track_data(raw_track_data))
 
-        safe_project_name = safe_h3_project_name(kwargs.get("project_name"))
-        project_save = str(_first_input(kwargs.get("project_save"), "new"))
-        if project_save not in {"new", "override"}:
-            raise ValueError("project_save must be 'new' or 'override'")
-        upscale_by = float(
-            _first_input(
-                sampling_config.get("upscale_by"),
-                _first_input(kwargs.get("upscale_by"), 1.250),
+        project_kwargs = {
+            name: kwargs[name]
+            for name in _SCENE_STUDIO_PROJECT_INPUT_NAMES
+            if name in kwargs
+        }
+
+        def render(final_tracks_info: dict) -> io.NodeOutput:
+            project_output = _scene_studio_render(
+                cls, tracks_info=final_tracks_info, **project_kwargs,
             )
-        )
-        if not math.isfinite(upscale_by) or upscale_by < 1:
-            raise ValueError(
-                "upscale_by must be a finite value greater than or equal to 1"
+            return io.NodeOutput(
+                final_tracks_info,
+                images_out,
+                audio_out,
+                video_out,
+                project_output[0],
+                project_output[1],
+                expand=project_output.expand,
             )
 
-        first_pass_width = int(info["width"])
-        first_pass_height = int(info["height"])
-        audio_only = (first_pass_width, first_pass_height) == (32, 32)
-        fps = float(info["frame_rate"])
-        target_width, target_height = h3_second_pass_dimensions(
-            first_pass_width,
-            first_pass_height,
-            run_second_pass,
-            upscale_by,
-        )
-        # Keep task inputs at the configured size; exports use the final size.
-        output_info = {**info, "width": target_width, "height": target_height}
-        initialize_h3_project(
-            safe_project_name,
-            output_info,
-            folder_paths.get_output_directory(),
-        )
-        all_entries = h3_task_entries(info)
-        segment_start_number = int(_first_input(kwargs.get("segment_start_number"), 1))
-        if segment_start_number < 1:
-            raise ValueError("segment_start_number must be at least 1")
-        segment_start_index = segment_start_number - 1
-        segment_count = int(_first_input(kwargs.get("segment_count"), -1))
-        selected_entries = select_h3_task_entries(
-            all_entries,
-            segment_start_index,
-            segment_count,
-        )
-        if not selected_entries:
-            raise ValueError(
-                "No H3 task segments are available from segment_start_number."
-            )
-        has_sampling_tasks = not is_passthrough and any(
-            not h3_task_is_passthrough(entry) for _, entry in selected_entries
-        )
+        enhancer_enabled = bool(_unwrap_list_scalar(kwargs.get("enhancer_enabled"), False))
+        if not enhancer_enabled:
+            return render(tracks_info)
 
-        first_selected_index, first_selected_entry = selected_entries[0]
-        first_selected_task = first_selected_entry.get("task", {})
-        first_selected_content = (
-            first_selected_task.get("content", {})
-            if isinstance(first_selected_task, dict)
-            else {}
+        info = _parse_track_data(_unwrap_list_scalar(tracks_info, {}))
+        tasks = _multitrack_task_segments(info)
+        if not tasks:
+            return render(tracks_info)
+
+        model_config = _unwrap_list_scalar(kwargs.get("model"), {})
+        if not isinstance(model_config, dict):
+            raise TypeError("model must be a DynamicCombo configuration dictionary.")
+        synchronous_model_config = dict(model_config)
+        synchronous_model_config["return_async"] = False
+        selected_model = str(
+            _unwrap_list_scalar(synchronous_model_config.get("model"), MINIMAX_MODEL)
         )
-        first_selected_continuity = (
-            str(first_selected_content.get("continuity_mode", "shot")).lower()
-            if isinstance(first_selected_content, dict)
-            else "shot"
+        configured_force_offload = bool(
+            _unwrap_list_scalar(synchronous_model_config.get("force_offload"), True)
         )
-        if first_selected_continuity == "context_test":
-            first_selected_continuity = "context"
-        if (
-            first_selected_index > 0
-            and first_selected_continuity in H3_CONTEXT_CONTINUITY_MODES
-            and not is_passthrough
-            and not h3_task_is_passthrough(first_selected_entry)
-        ):
-            previous_index = first_selected_index - 1
-            if not has_h3_context_latent(
-                safe_project_name,
-                previous_index,
-                resolution="high",
-                output_directory=folder_paths.get_output_directory(),
-            ):
-                raise ValueError(
-                    f"Cannot start segment {first_selected_index + 1} with "
-                    f"{first_selected_continuity}: segment {previous_index + 1} "
-                    "has no active context latent. Generate or restore the "
-                    "previous segment first."
+        selected_seed = int(_unwrap_list_scalar(kwargs.get("enhancer_seed"), 0))
+        llama_model = kwargs.get("llama_model")
+        api_account = kwargs.get("api_account")
+
+        task_media_info = info
+        if info.get("task_markers"):
+            # MultiTrackTaskOutput indexes by sorted segment order; drop markers so
+            # task_index stays aligned with _multitrack_task_segments above.
+            task_media_info = dict(info)
+            task_media_info["task_markers"] = []
+
+        enhanced_prompts: list[object] = []
+        expanded_graph: dict[str, dict] = {}
+        segment_progress = ProgressBar(len(tasks)) if len(tasks) > 1 else None
+        if segment_progress is not None:
+            segment_progress.update_absolute(0, len(tasks))
+        for task_index in range(len(tasks)):
+            task_output = MultiTrackTaskOutput.execute(
+                tracks_info=task_media_info, task_index=task_index, prompt_format="api",
+            )
+            system_prompt = task_output[0]
+            user_prompt = task_output[1]
+            task_type = task_output[2]
+            length = task_output[3]
+            selected_images = task_output[4]
+            selected_audio = task_output[5]
+            selected_video = task_output[6]
+            segment_model_config = dict(synchronous_model_config)
+            if selected_model == LLAMACPP_MODEL and len(tasks) > 1:
+                segment_model_config["force_offload"] = (
+                    configured_force_offload and task_index == len(tasks) - 1
                 )
-            previous_is_passthrough = (
-                h3_active_segment_is_passthrough(
-                    safe_project_name,
-                    previous_index,
-                    folder_paths.get_output_directory(),
-                )
-                if is_selflift else False
+            result = MultiTrackPromptEnhancer.execute(
+                system_prompt=[system_prompt],
+                user_prompt=[user_prompt],
+                type=[task_type],
+                length=[length],
+                images=selected_images,
+                audio=selected_audio,
+                video=selected_video,
+                llama_model=llama_model,
+                model=[segment_model_config],
+                seed=[selected_seed],
+                enabled=[True],
+                api_account=api_account,
             )
-            if is_selflift and not has_h3_context_latent(
-                safe_project_name,
-                previous_index,
-                resolution="low",
-                output_directory=folder_paths.get_output_directory(),
-                allow_low_fallback=previous_is_passthrough,
-            ):
-                raise ValueError(
-                    f"Cannot start SelfLift segment {first_selected_index + 1} "
-                    f"with {first_selected_continuity}: segment "
-                    f"{previous_index + 1} has no active low-resolution context "
-                    "latent. Regenerate the previous segment with SelfLift first."
-                )
-        resume_task_index: int | None = None
-        if run_second_pass and selected_entries:
-            first_selected_index = selected_entries[0][0]
-            if has_h3_first_pass_checkpoint(
-                safe_project_name,
-                first_selected_index,
-                folder_paths.get_output_directory(),
-            ):
-                resume_task_index = first_selected_index
-                log_node_info(
-                    node_name,
-                    f"Resuming segment {first_selected_index} from its first-pass checkpoint",
-                )
+            enhanced_prompts.append(result[0])
+            if result.expand:
+                expanded_graph.update(result.expand)
+            if segment_progress is not None:
+                segment_progress.update_absolute(task_index + 1, len(tasks))
 
-        if project_save == "override" and segment_count == -1:
-            clear_h3_project_segments_from(
-                safe_project_name,
-                (
-                    resume_task_index + 1
-                    if resume_task_index is not None
-                    else segment_start_index
-                ),
-                folder_paths.get_output_directory(),
-            )
-            report_step(19)
-
-        if first_pass_only and has_second_pass:
-            selected_entries = selected_entries[:1]
-        log_node_info(
-            node_name,
-            f"Found {len(all_entries)} segments; processing {len(selected_entries)}",
-        )
-        report_step(20)
-        first_pass_seed = int(_first_input(kwargs.get("seed"), 42))
-        second_pass_seed = first_pass_seed
-        selected_upscale_model = str(
-            _first_input(
-                sampling_config.get("upscale_model"),
-                _first_input(kwargs.get("upscale_model"), "None"),
-            )
-        )
-        if not uses_linked_prepare and audio_vae is None:
-            raise ValueError(
-                "model_loader must include audio_vae to decode MiniMax H3 audio."
-            )
-        report_step(25)
-
-        graph = GraphBuilder()
-        report_step(27)
-        preset_name = str(_first_input(kwargs.get("sampling_plan"), "medium"))
-        has_context_second_pass = run_second_pass and has_sampling_tasks and any(
-            task_index > 0 and isinstance(entry.get("task"), dict)
-            and not h3_task_is_passthrough(entry)
-            and isinstance(entry["task"].get("content"), dict)
-            and str(entry["task"]["content"].get("continuity_mode", "shot")).lower()
-            in H3_CONTEXT_CONTINUITY_MODES for task_index, entry in selected_entries
-        )
-        if uses_linked_prepare:
-            def raw_sampling_input(name: str) -> Any:
-                value = sampling_config.get(name)
-                return _raw_project_input(value if value is not None else kwargs.get(name))
-
-            tracks_info_link = _hidden_project_input_link(
-                hidden_inputs,
-                "tracks_info",
-            )
-            project_media_static = graph.node(
-                "easy h3ProjectStaticPrepare",
-                id="project_media_prepare",
-                tracks_info=tracks_info_link or info,
-            )
-            model_inputs = {
-                "model_loader": selected_model_loader,
-                "sampling_plan": preset_name,
-                "sampling_mode": sampling_mode if has_sampling_tasks else "passthrough",
-                "run_second_pass": run_second_pass and has_sampling_tasks,
-                "has_context_second_pass": has_context_second_pass,
-                "turbo_hint": first_is_turbo,
+        if expanded_graph:
+            graph = GraphBuilder()
+            apply_inputs: dict[str, object] = {
+                "tracks_info": info,
+                "prompt_count": len(enhanced_prompts),
+                "images": images_out,
+                "audio": audio_out,
+                "video": video_out,
             }
-            for name, value in (
-                ("model_loader_2nd", second_model_loader),
-                ("sampler", raw_sampling_input("sampler")),
-                ("sigmas", raw_sampling_input("sigmas")),
-                ("sampler_2nd", raw_sampling_input("sampler_2nd")),
-                ("sigmas_2nd", raw_sampling_input("sigmas_2nd")),
-            ):
-                if value is not None:
-                    model_inputs[name] = value
-            project_model_static = graph.node(
-                "easy h3ProjectStaticPrepare",
-                id="project_model_prepare",
-                **model_inputs,
-            )
-            model, second_model = project_model_static.out(2), project_model_static.out(3)
-            clip, vae = project_model_static.out(4), project_model_static.out(5)
-            audio_vae, preview_vae = project_model_static.out(6), project_model_static.out(7)
-            full_locked_audio = project_media_static.out(8)
-            first_pass_sampler, first_pass_sigmas = project_model_static.out(9), project_model_static.out(10)
-            second_pass_sampler, second_pass_sigmas = project_model_static.out(11), project_model_static.out(12)
-            context_second_pass_sigmas = project_model_static.out(13)
-            task_tracks_info_base = shared_images = shared_audio = shared_video = None
-        else:
-            (task_tracks_info_base, shared_images, shared_audio, shared_video,
-             full_locked_audio) = prepare_multitrack_project_media(info)
-            first_pass_sampler = first_pass_sigmas = None
-            if has_sampling_tasks and any(
-                task_index != resume_task_index and not h3_task_is_passthrough(entry)
-                for task_index, entry in selected_entries
-            ):
-                if is_selflift:
-                    first_pass_sigmas = _h3_resolve_selflift_sigmas(
-                        graph, sigmas=_first_input(kwargs.get("sigmas")),
-                        preset_name=preset_name, is_turbo=first_is_turbo)
-                else:
-                    first_pass_sampler, first_pass_sigmas = _h3_resolve_pass_sampling(
-                        graph, pass_name="first_pass", sampler=_first_input(kwargs.get("sampler")),
-                        sigmas=_first_input(kwargs.get("sigmas")), preset_name=preset_name,
-                        has_second_pass=has_second_pass, is_turbo=first_is_turbo)
-            second_pass_sampler = second_pass_sigmas = context_second_pass_sigmas = None
-            if run_second_pass and has_sampling_tasks:
-                configured_sampler = _first_input(sampling_config.get("sampler_2nd"), _first_input(kwargs.get("sampler_2nd")))
-                configured_sigmas = _first_input(sampling_config.get("sigmas_2nd"), _first_input(kwargs.get("sigmas_2nd")))
-                custom_second = configured_sampler is not None or configured_sigmas is not None
-                second_pass_sampler, second_pass_sigmas = _h3_resolve_pass_sampling(
-                    graph, pass_name="second_pass", sampler=configured_sampler,
-                    sigmas=configured_sigmas, preset_name=preset_name,
-                    has_second_pass=True, is_turbo=second_is_turbo)
-                if has_context_second_pass:
-                    context_second_pass_sigmas = _h3_resolve_context_second_pass_sigmas(
-                        graph, preset_name=preset_name, is_turbo=second_is_turbo,
-                        has_custom_second_pass_sampling=custom_second)
-        report_step(31)
-
-        report_step(33)
-
-        previous_hires_context_latent: Any | None = None
-        previous_low_context_latent: Any | None = None
-        previous_reference_frame: Any | None = None
-        previous_artifact: Any | None = None
-        last_project_output: Any | None = None
-        report_step(35)
-
-        segment_total = len(selected_entries)
-        segment_nodes: dict[str, int] = {}
-        for segment_position, (task_index, entry) in enumerate(selected_entries):
-            previous_graph_nodes = set(graph.nodes)
-            def report_segment_step(
-                phase: float,
-                *,
-                current_position: int = segment_position,
-            ) -> None:
-                target = 35 + 60 * (current_position + phase) / segment_total
-                report_step(target)
-
-            task_type = h3_task_type(entry, info)
-            generation_mode = h3_generation_mode(task_type)
-            task = entry.get("task", {})
-            content = task.get("content", {}) if isinstance(task, dict) else {}
-            task_is_passthrough = is_passthrough or h3_task_is_passthrough(entry)
-            locked_audio_track = h3_locked_audio_track(entry, info)
-            locked_video_track = h3_locked_video_track(entry, info)
-            has_task_locked_audio = locked_audio_track is not None
-            preserve_source_timing = not audio_only and (
-                has_task_locked_audio or locked_video_track is not None
-            )
-            fit_locked_video_timing = (
-                preserve_source_timing
-                and locked_video_track is not None
-            )
-
-            ref_image_size = (
-                str(content.get("ref_image_size", "match")).lower()
-                if isinstance(content, dict)
-                else "match"
-            )
-            report_segment_step(0.0)
-            report_segment_step(0.04)
-            task_start_frame = max(0, int(entry.get("start_frame", 0)))
-            task_end_frame = max(
-                task_start_frame,
-                int(entry.get("end_frame", task_start_frame)),
-            )
-            task_duration_frames = max(1, task_end_frame - task_start_frame)
-            if uses_linked_prepare:
-                segment_static = graph.node(
-                    "easy h3ProjectStaticPrepare", id=f"segment_static_prepare_{task_index}",
-                    project_static=project_media_static.out(0), task_start_frame=task_start_frame,
-                    task_index=task_index,
-                    task_duration_frames=task_duration_frames, fps=fps,
-                    generation_mode="reference" if task_is_passthrough else generation_mode,
-                    **(
-                        {"previous": previous_artifact}
-                        if previous_artifact is not None
-                        else {}
-                    ),
-                )
-                task_tracks_info, task_locked_audio = segment_static.out(1), segment_static.out(8)
-                task_output = graph.node(
-                    "easy multiTrackTaskOutput",
-                    id=f"task_{task_index}",
-                    tracks_info=task_tracks_info,
-                    task_index=task_index,
-                    prompt_format="default",
-                )
-                base_task_length = task_output.out(3)
-                if preserve_source_timing:
-                    base_task_length = task_duration_frames
-            else:
-                task_shared_audio, task_shared_video, task_locked_audio = crop_multitrack_project_media(
-                    shared_audio, shared_video, full_locked_audio, task_start_frame,
-                    task_duration_frames, fps,
-                )
-                task_tracks_info = prepare_multitrack_project_task_info(
-                    task_tracks_info_base, shared_images,
-                    task_shared_audio if generation_mode == "reference" or task_is_passthrough else [],
-                    task_shared_video if generation_mode == "reference" or task_is_passthrough else [],
-                    task_entry=entry,
-                )
-                task_output = graph.node(
-                    "easy multiTrackTaskOutput", id=f"task_{task_index}",
-                    tracks_info=task_tracks_info,
-                    **({"previous": previous_artifact} if previous_artifact is not None else {}),
-                    task_index=task_index, prompt_format="default",
-                )
-                base_task_length = task_output.out(3)
-                if preserve_source_timing:
-                    base_task_length = task_duration_frames
-            if task_is_passthrough:
-                if audio_only:
-                    raise ValueError("Passthrough requires a video project, not audio-only mode")
-                passthrough = graph.node(
-                    "easy h3PassthroughVideo",
-                    id=f"passthrough_video_{task_index}",
-                    videos=task_output.out(6),
-                    frame_count=task_duration_frames,
-                    fps=fps,
-                    width=target_width,
-                    height=target_height,
-                    project_name=safe_project_name,
-                    segment_index=task_index,
-                )
-                context_latent = _h3_encode_context_media(
-                    graph, passthrough.out(1), passthrough.out(2), vae, audio_vae,
-                    f"passthrough_context_{task_index}",
-                )
-                runtime_context_latent = graph.node(
-                    "easy h3MotionContextLatentTrim",
-                    id=f"trim_hires_context_latent_{task_index}",
-                    latent=context_latent,
-                    context_length=str(H3_CONTEXT_SOURCE_FRAMES),
-                ).out(0)
-                saved_video_end = graph.node(
-                    "easy h3SegmentSaveEnd",
-                    id=f"save_end_{task_index}",
-                    video_path=passthrough.out(0),
-                    project_name=safe_project_name,
-                    segment_index=task_index,
-                )
-                artifact_inputs = {
-                    "project_name": safe_project_name,
-                    "project_save": project_save,
-                    "segment_index": task_index,
-                    "context_latent": runtime_context_latent,
-                    "video_path": saved_video_end.out(0),
-                    "tracks_info": output_info,
-                    "continuity_mode": "shot",
-                    "seed": first_pass_seed,
-                    "sampling_pass": "single",
+            apply_inputs.update(
+                {
+                    f"prompt_{index}": prompt
+                    for index, prompt in enumerate(enhanced_prompts)
                 }
-                if previous_artifact is not None:
-                    artifact_inputs["previous"] = previous_artifact
-                artifact = graph.node(
-                    "easy h3ProjectArtifact",
-                    id=f"artifact_{task_index}",
-                    **artifact_inputs,
-                )
-                previous_artifact = last_project_output = artifact.out(0)
-                previous_hires_context_latent = runtime_context_latent
-                previous_low_context_latent = runtime_context_latent
-                previous_reference_frame = passthrough.out(1)
-                segment_nodes.update({
-                    node_id: task_index
-                    for node_id in graph.nodes.keys() - previous_graph_nodes
-                })
-                report_segment_step(1.0)
-                continue
-            continuity_mode = (
-                str(content.get("continuity_mode", "shot")).lower()
-                if isinstance(content, dict)
-                else "shot"
             )
-            if continuity_mode == "context_test":
-                continuity_mode = "context"
-            uses_context = continuity_mode in H3_CONTEXT_CONTINUITY_MODES
-            uses_swap = continuity_mode in {"context_drift", "context_swap"}
-            aligned_task_length: Any = (
-                minimax_frame_count(base_task_length, round_up=True)
-                if preserve_source_timing
-                else base_task_length
+            apply_inputs.update(_scene_studio_apply_graph_inputs(project_kwargs))
+            apply_node = graph.node(
+                SCENE_STUDIO_PROMPT_APPLY_NODE_ID,
+                id="scene_studio_prompt_apply",
+                **apply_inputs,
             )
-            task_length: Any = aligned_task_length
-            will_have_context_continuity = (
-                uses_context
-                and (previous_hires_context_latent is not None or task_index > 0)
+            expanded_graph.update(graph.finalize())
+            return io.NodeOutput(
+                apply_node.out(0),
+                apply_node.out(1),
+                apply_node.out(2),
+                apply_node.out(3),
+                apply_node.out(4),
+                apply_node.out(5),
+                expand=expanded_graph,
             )
-            context_source_frames = H3_CONTEXT_SOURCE_FRAMES
-            context_generation_frames = 34
-            if will_have_context_continuity:
-                task_length = graph.node(
-                    "ComfyMathExpression",
-                    id=f"context_length_{task_index}",
-                    expression=f"a + {context_generation_frames}",
-                    **{"values.a": task_length},
-                ).out(1)
-            report_segment_step(0.10)
-            task_images = task_output.out(4)
-            if continuity_mode == "last_frame_ref" and generation_mode != "reference":
-                log_node_info(
-                    node_name,
-                    f"Segment {task_index}: last_frame_ref needs ref/edit task mode; "
-                    "ignoring it, this segment has no motion continuity",
-                )
-            elif (
-                continuity_mode == "last_frame_ref"
-                and previous_reference_frame is not None
-            ):
-                task_images = graph.node(
-                    "easy h3PreviousFrameReference",
-                    id=f"previous_frame_reference_{task_index}",
-                    images=task_images,
-                    previous_video=previous_reference_frame,
-                ).out(0)
-            conditioning_inputs = {
-                "clip": clip, "vae": vae, "audio_vae": audio_vae,
-                "images": task_images, "prompt": task_output.out(1),
-                "mode": generation_mode,
-                "width": target_width if is_selflift else first_pass_width,
-                "height": target_height if is_selflift else first_pass_height,
-                "length": task_length, "ref_image_size": ref_image_size,
-            }
-            if generation_mode == "reference":
-                conditioning_inputs.update({
-                    "audios": task_output.out(5),
-                    "videos": task_output.out(6),
-                })
-                if fit_locked_video_timing:
-                    conditioning_inputs["locked_video_timing_frames"] = (
-                        aligned_task_length
-                    )
-            encoded_conditioning = graph.node(
-                "easy minimaxH3ToVideo",
-                id=f"conditioning_{task_index}",
-                **conditioning_inputs,
-            )
-            conditioning = graph.node(
-                "easy h3ConditioningCache",
-                id=f"conditioning_cache_{task_index}",
-                project_name=safe_project_name,
-                segment_index=task_index,
-                tracks_info=task_tracks_info,
-                task_output_ready=task_output.out(1),
-                model=model,
-                clip=clip,
-                vae=vae,
-                audio_vae=audio_vae,
-                conditioning=encoded_conditioning.out(0),
-                latent=encoded_conditioning.out(1),
-            )
-            base_positive = second_pass_positive = conditioning.out(0)
-            # Reference conditioning has no canvas-sized keyframes. Its text and
-            # media embeddings can be shared by both sampling resolutions.
-            if run_second_pass and generation_mode != "reference" and (
-                first_pass_width,
-                first_pass_height,
-            ) != (target_width, target_height):
-                second_inputs = {
-                    **conditioning_inputs,
-                    "width": target_width,
-                    "height": target_height,
-                }
-                second_pass_positive = graph.node(
-                    "easy minimaxH3ToVideo",
-                    id=f"second_pass_conditioning_{task_index}",
-                    **second_inputs,
-                ).out(0)
-            initial_latent = conditioning.out(1)
-            positive = base_positive
 
-            if (
-                uses_context
-                and previous_hires_context_latent is None
-                and task_index > 0
-            ):
-                report_segment_step(0.14)
-                loaded_hires_context = graph.node(
-                    "easy h3ProjectContextLatentLoad",
-                    id=f"load_hires_context_{task_index}",
-                    project_name=safe_project_name,
-                    segment_index=task_index - 1,
-                    resolution="high",
-                )
-                previous_hires_context_latent = loaded_hires_context.out(0)
-                if has_second_pass or is_selflift:
-                    loaded_low_context = graph.node(
-                        "easy h3ProjectContextLatentLoad",
-                        id=f"load_low_context_{task_index}",
-                        project_name=safe_project_name,
-                        segment_index=task_index - 1,
-                        resolution="low",
-                    )
-                    previous_low_context_latent = loaded_low_context.out(0)
-                else:
-                    previous_low_context_latent = previous_hires_context_latent
-                report_segment_step(0.18)
-            context_trim_frames: Any | None = None
-            first_pass_context_trim_frames: Any | None = None
-            first_pass_context_latent = (
-                previous_low_context_latent
-                if has_second_pass
-                else previous_hires_context_latent
-            )
-            has_context_continuity = (
-                uses_context
-                and first_pass_context_latent is not None
-            )
-            # Lock task audio after the context source is known so its timeline
-            # can be shifted behind the copied source prefix. The extra 12
-            # generated frames required by H3's temporal grid are removed from
-            # the tail after decoding, not from the task's opening frames.
-            if has_task_locked_audio:
-                report_segment_step(0.20)
-                initial_latent = graph.node(
-                    "easy minimaxH3AudioLock",
-                    id=f"audio_lock_{task_index}",
-                    latent=initial_latent,
-                    audio_vae=audio_vae,
-                    audio=task_locked_audio,
-                    remix_strength=1.0,
-                    short_audio_mode="silence",
-                    prepend_frames=(
-                        context_source_frames if has_context_continuity else 0
-                    ),
-                    frame_rate=fps,
-                ).out(0)
+        prompt_texts = [str(prompt) for prompt in enhanced_prompts]
+        final_tracks_info = _apply_multitrack_enhanced_prompts_to_field(info, prompt_texts)
+        return render(final_tracks_info)
 
-            first_pass_sampling_model = model
-            if has_context_continuity:
-                report_segment_step(0.22)
-                if uses_swap:
-                    context_swap = graph.node(
-                        "easy MiniMaxH3ContextSwap",
-                        id=f"first_pass_context_swap_noise_{task_index}",
-                        model=model,
-                        latent=initial_latent,
-                        context_latent=first_pass_context_latent,
-                        sigmas=first_pass_sigmas,
-                        context_length=str(context_source_frames),
-                        seed=(first_pass_seed + task_index) & 0xFFFFFFFFFFFFFFFF,
-                        continue_audio=True,
-                        freeze_audio=False,
-                    )
-                    first_pass_sampling_model = context_swap.out(0)
-                    initial_latent = context_swap.out(1)
-                    first_pass_context_trim_frames = context_swap.out(2)
-                    context_trim_frames = first_pass_context_trim_frames
-                else:
-                    motion_context = graph.node(
-                        "easy MiniMaxH3MotionContextHard",
-                        id=f"hard_motion_context_{task_index}",
-                        conditioning=positive,
-                        vae=vae,
-                        latent=initial_latent,
-                        context_latent=first_pass_context_latent,
-                        context_length=str(context_source_frames),
-                        video_transition_steps=4,
-                        audio_transition_steps=4,
-                        video_anchor_only=not audio_only,
-                    )
-                    positive = motion_context.out(0)
-                    first_pass_context_trim_frames = motion_context.out(1)
-                    context_trim_frames = first_pass_context_trim_frames
-                    initial_latent = motion_context.out(2)
-            else:
-                report_segment_step(0.22)
 
-            report_segment_step(0.28)
-            selflift_low_latent: Any | None = None
-            if is_selflift:
-                report_segment_step(0.38)
-                selflift_inputs: dict[str, Any] = {
-                    "model": first_pass_sampling_model,
-                    "highres_model": (
-                        second_model
-                        if second_model_loader is not None
-                        else first_pass_sampling_model
-                    ),
-                    "positive": positive,
-                    "vae": vae,
-                    "latent_image": initial_latent,
-                    "sigmas": first_pass_sigmas,
-                    "seed": first_pass_seed,
-                    "transition_ratio": transition_ratio,
-                    "lowres_scale": lowres_scale,
-                    "rho": 0.1 if has_context_continuity else 0.0,
-                    "w_max": 0.7,
-                    "w_min": 0.25,
-                    "upscaler_model": selected_upscale_model,
-                    "enabled_tiling": tiling_enabled,
-                    "tile_count": tile_count,
-                }
-                if has_sampling_preview:
-                    selflift_inputs.update({
-                        "preview_vae": preview_vae,
-                        "preview_node_id": preview_node_id,
-                        "generated_frame_count": task_length,
-                        "preview_fps": fps,
-                        "segment_index": task_index,
-                        "sampling_pass": "selflift",
-                    })
-                if (
-                    has_context_continuity
-                    and previous_low_context_latent is not None
-                ):
-                    selflift_inputs["low_context_latent"] = previous_low_context_latent
-                if previous_artifact is not None:
-                    selflift_inputs["previous"] = previous_artifact
-                selflift_sample = graph.node(
-                    "easy minimaxH3SelfLiftSampler",
-                    id=f"selflift_sample_{task_index}",
-                    **selflift_inputs,
-                )
-                first_pass_latent = selflift_sample.out(0)
-                selflift_low_latent = selflift_sample.out(1)
-            else:
-                first_pass_guider = graph.node(
-                    "BasicGuider",
-                    id=f"first_pass_guider_{task_index}",
-                    model=first_pass_sampling_model,
-                    conditioning=positive,
-                )
-                if task_index == resume_task_index:
-                    report_segment_step(0.38)
-                    first_pass_latent = graph.node(
-                        "easy h3ProjectContextLatentLoad",
-                        id=f"resume_first_pass_{task_index}",
-                        project_name=safe_project_name,
-                        segment_index=task_index,
-                    ).out(0)
-                else:
-                    report_segment_step(0.32)
-                    first_pass_noise = graph.node(
-                        "RandomNoise",
-                        id=f"first_pass_noise_{task_index}",
-                        noise_seed=first_pass_seed,
-                    )
-                    report_segment_step(0.38)
-                    sampling_inputs: dict[str, Any] = {
-                        "noise": first_pass_noise.out(0),
-                        "guider": first_pass_guider.out(0),
-                        "sampler": first_pass_sampler,
-                        "sigmas": first_pass_sigmas,
-                        "latent_image": initial_latent,
-                        "project_name": safe_project_name,
-                        "segment_index": task_index,
-                    }
-                    if previous_artifact is not None:
-                        sampling_inputs["previous"] = previous_artifact
-                    sampling_start = graph.node(
-                        "easy h3SegmentSamplingStart",
-                        id=f"sampling_start_{task_index}",
-                        sampling_pass="first",
-                        **sampling_inputs,
-                    )
-                    preview_inputs = (
-                        {
-                            "preview_vae": preview_vae,
-                            "preview_node_id": preview_node_id,
-                            "generated_frame_count": task_length,
-                            "preview_fps": fps,
-                            "segment_index": task_index,
-                            "sampling_pass": "first",
-                        }
-                        if has_sampling_preview
-                        else {}
-                    )
-                    first_pass_sample = graph.node(
-                        "easy h3SamplingPreviewSampler"
-                        if has_sampling_preview
-                        else "SamplerCustomAdvanced",
-                        id=f"first_pass_sample_{task_index}",
-                        noise=sampling_start.out(0),
-                        guider=sampling_start.out(1),
-                        sampler=sampling_start.out(2),
-                        sigmas=sampling_start.out(3),
-                        latent_image=sampling_start.out(4),
-                        **preview_inputs,
-                    )
-                    first_pass_latent = first_pass_sample.out(1)
-            final_latent = first_pass_latent
-            report_segment_step(0.42)
+class EasySceneStudioPromptApply(io.ComfyNode):
+    """Apply dynamically expanded local llama.cpp enhancer results to Scene
+    Studio's enhanced_prompt field, then run the shared project core so a
+    local-provider enhancer pass still produces a fully rendered segment."""
 
-            if run_second_pass:
-                segment_second_pass_sigmas = second_pass_sigmas
-                if (
-                    uses_context
-                    and previous_hires_context_latent is not None
-                    and context_second_pass_sigmas is not None
-                ):
-                    segment_second_pass_sigmas = context_second_pass_sigmas
-                if audio_only or upscale_by <= 1:
-                    report_segment_step(0.46)
-                    upscaled_latent = final_latent
-                else:
-                    report_segment_step(0.45)
-                    separated = graph.node(
-                        "LTXVSeparateAVLatent",
-                        id=f"separate_first_pass_{task_index}",
-                        av_latent=final_latent,
-                    )
-                    if selected_upscale_model != "None":
-                        report_segment_step(0.50)
-                        upscaled_video = graph.node(
-                            "easy minimaxH3LatentUpscaler",
-                            id=f"latent_upscale_{task_index}",
-                            **_h3_latent_upscale_inputs(
-                                separated.out(0),
-                                selected_upscale_model,
-                                target_width,
-                                target_height
-                            ),
-                        )
-                        video_latent = upscaled_video.out(0)
-                    else:
-                        report_segment_step(0.48)
-                        first_pass_images = graph.node(
-                            "VAEDecode",
-                            id=f"first_pass_decode_{task_index}",
-                            samples=separated.out(0),
-                            vae=vae,
-                        )
-                        report_segment_step(0.51)
-                        resized = graph.node(
-                            "ImageResizeKJv2",
-                            id=f"first_pass_resize_{task_index}",
-                            **_h3_image_resize_inputs(
-                                first_pass_images.out(0),
-                                target_width,
-                                target_height,
-                            ),
-                        )
-                        report_segment_step(0.54)
-                        encoded_video = graph.node(
-                            "VAEEncode",
-                            id=f"first_pass_reencode_{task_index}",
-                            pixels=resized.out(0),
-                            vae=vae,
-                        )
-                        video_latent = encoded_video.out(0)
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id=SCENE_STUDIO_PROMPT_APPLY_NODE_ID,
+            display_name="Scene Studio Prompt Enhance Apply",
+            category=CATEGORY_MULTITRACK + "/internal",
+            is_dev_only=True,
+            enable_expand=True,
+            not_idempotent=True,
+            accept_all_inputs=True,
+            inputs=[
+                TYPE_TRACKS_INFO.Input("tracks_info"),
+                io.Int.Input("prompt_count", min=0),
+            ],
+            hidden=[io.Hidden.prompt, io.Hidden.unique_id],
+            outputs=[
+                TYPE_TRACKS_INFO.Output("TRACKS_INFO"),
+                io.Image.Output("IMAGES", is_output_list=True),
+                io.Audio.Output("AUDIO", is_output_list=True),
+                io.Video.Output("VIDEO", is_output_list=True),
+                io.String.Output("PROJECT_NAME"),
+                io.Audio.Output("LOCKED_AUDIO"),
+            ],
+        )
 
-                    report_segment_step(0.57)
-                    upscaled_latent = graph.node(
-                        "LTXVConcatAVLatent",
-                        id=f"first_pass_recombine_{task_index}",
-                        video_latent=video_latent,
-                        audio_latent=separated.out(1),
-                    ).out(0)
-
-                second_pass_sampling_model = second_model
-                if (
-                    uses_context
-                    and previous_hires_context_latent is not None
-                ):
-                    report_segment_step(0.59)
-                    # Second pass is deliberately kept as an ordinary hi-res refine path.
-                    # No context noise, no split-prior, and no Drift-Control patching here.
-                    hires_continuity = graph.node(
-                        "easy MiniMaxH3HiResContinuity",
-                        id=f"hires_continuity_{task_index}",
-                        current_hires_latent=upscaled_latent,
-                        previous_hires_latent=previous_hires_context_latent,
-                        context_length=str(H3_CONTEXT_SOURCE_FRAMES),
-                        video_transition_steps=4,
-                        video_anchor_only=not audio_only,
-                    )
-                    upscaled_latent = hires_continuity.out(0)
-                    context_trim_frames = hires_continuity.out(1)
-
-                report_segment_step(0.62)
-                second_pass_noise = graph.node(
-                    "DisableNoise" if disable_2nd_noise else "RandomNoise",
-                    id=f"second_pass_noise_{task_index}",
-                    **({} if disable_2nd_noise else {"noise_seed": second_pass_seed}),
-                )
-                report_segment_step(0.66)
-                second_pass_guider = graph.node(
-                    "BasicGuider",
-                    id=f"second_pass_guider_{task_index}",
-                    model=second_pass_sampling_model,
-                    conditioning=second_pass_positive,
-                )
-                report_segment_step(0.71)
-                second_sampling_start = graph.node(
-                    "easy h3SegmentSamplingStart",
-                    id=f"second_sampling_start_{task_index}",
-                    noise=second_pass_noise.out(0),
-                    guider=second_pass_guider.out(0),
-                    sampler=second_pass_sampler,
-                    sigmas=segment_second_pass_sigmas,
-                    latent_image=upscaled_latent,
-                    project_name=safe_project_name,
-                    segment_index=task_index,
-                    sampling_pass="second",
-                )
-                second_preview_inputs = (
-                    {
-                        "preview_vae": preview_vae,
-                        "preview_node_id": preview_node_id,
-                        "generated_frame_count": task_length,
-                        "preview_fps": fps,
-                        "segment_index": task_index,
-                        "sampling_pass": "second",
-                    }
-                    if has_sampling_preview
-                    else {}
-                )
-                if tiling_enabled:
-                    second_preview_inputs.update({
-                        "enabled_tiling": True,
-                        "tile_count": tile_count,
-                    })
-                second_pass_sample = graph.node(
-                    "easy h3SamplingPreviewSampler"
-                    if has_sampling_preview or tiling_enabled
-                    else "SamplerCustomAdvanced",
-                    id=f"second_pass_sample_{task_index}",
-                    noise=second_sampling_start.out(0),
-                    guider=second_sampling_start.out(1),
-                    sampler=second_sampling_start.out(2),
-                    sigmas=second_sampling_start.out(3),
-                    latent_image=second_sampling_start.out(4),
-                    **second_preview_inputs,
-                )
-                final_latent = second_pass_sample.out(1)
-            else:
-                report_segment_step(0.71)
-
-            low_stage_context_latent = (
-                selflift_low_latent
-                if is_selflift and selflift_low_latent is not None
-                else first_pass_latent
-                if has_second_pass
-                else final_latent
-            )
-            hires_context_reencoded = False
-            low_context_reencoded = False
-            if audio_only:
-                output_audio = graph.node(
-                    "VAEDecodeAudio",
-                    id=f"decode_audio_{task_index}",
-                    samples=final_latent,
-                    vae=audio_vae,
-                ).out(0)
-                project_hires_context_latent = final_latent
-                project_low_context_latent = low_stage_context_latent
-                if context_trim_frames is not None:
-                    output_audio, project_hires_context_latent = _h3_encode_audio_context(
-                        graph, output_audio, audio_vae, context_trim_frames,
-                        base_task_length, fps, not has_task_locked_audio,
-                        f"hires_audio_context_{task_index}",
-                    )
-                    if (has_second_pass and run_second_pass) or (
-                        is_selflift and selflift_low_latent is not None
-                    ):
-                        low_audio = graph.node(
-                            "VAEDecodeAudio", id=f"low_audio_context_decode_{task_index}",
-                            samples=low_stage_context_latent, vae=audio_vae,
-                        ).out(0)
-                        _, project_low_context_latent = _h3_encode_audio_context(
-                            graph, low_audio, audio_vae, first_pass_context_trim_frames,
-                            base_task_length, fps, not has_task_locked_audio,
-                            f"low_audio_context_{task_index}",
-                        )
-                    else:
-                        project_low_context_latent = project_hires_context_latent
-
-                report_segment_step(0.89)
-                saved_audio = output_audio
-                if has_task_locked_audio:
-                    saved_audio = graph.node(
-                        "easy h3LockedAudioSelect",
-                        id=f"locked_audio_select_{task_index}",
-                        generated_audio=output_audio,
-                        locked_audio=task_locked_audio,
-                    ).out(0)
-                saved_media_inputs = {
-                    "audio": saved_audio,
-                }
-            else:
-                report_segment_step(0.76)
-                decoded_images = graph.node(
-                    "VAEDecode",
-                    id=f"decode_video_{task_index}",
-                    samples=final_latent,
-                    vae=vae,
-                )
-                report_segment_step(0.80)
-                decoded_audio = graph.node(
-                    "VAEDecodeAudio",
-                    id=f"decode_audio_{task_index}",
-                    samples=final_latent,
-                    vae=audio_vae,
-                )
-                output_images = decoded_images.out(0)
-                output_audio = decoded_audio.out(0)
-                if context_trim_frames is not None or preserve_source_timing:
-                    report_segment_step(0.84)
-                    trimmed = graph.node(
-                        "easy h3ContextMediaTrim",
-                        id=f"motion_context_trim_{task_index}",
-                        images=output_images,
-                        audio=output_audio,
-                        trim_frames=(
-                            context_trim_frames if context_trim_frames is not None else 0
-                        ),
-                        output_frames=base_task_length,
-                        pad_audio=not has_task_locked_audio,
-                        **(
-                            {"fit_video_duration": True}
-                            if fit_locked_video_timing
-                            else {}
-                        ),
-                        fps=fps,
-                    )
-                    output_images = trimmed.out(0)
-                    output_audio = trimmed.out(1)
-                else:
-                    report_segment_step(0.84)
-
-                if has_task_locked_audio:
-                    locked_audio_align = graph.node(
-                        "easy h3LockedAudioDurationAlign",
-                        id=f"locked_audio_duration_align_{task_index}",
-                        images=output_images,
-                        audio=output_audio,
-                        fps=fps,
-                    )
-                    output_audio = locked_audio_align.out(0)
-
-                saved_audio = output_audio
-                if has_task_locked_audio:
-                    saved_audio = graph.node(
-                        "easy h3LockedAudioSelect",
-                        id=f"locked_audio_select_{task_index}",
-                        generated_audio=output_audio,
-                        locked_audio=task_locked_audio,
-                    ).out(0)
-
-                project_hires_context_latent = final_latent
-                project_low_context_latent = low_stage_context_latent
-                low_delivered_images: Any | None = None
-                if context_trim_frames is not None or preserve_source_timing:
-                    # Rebuild continuity from the delivered span after removing
-                    # the optional context head and temporal-grid tail.
-                    project_hires_context_latent = _h3_encode_context_media(
-                        graph,
-                        output_images,
-                        output_audio,
-                        vae,
-                        audio_vae,
-                        f"hires_context_{task_index}",
-                    )
-                    hires_context_reencoded = True
-                    if (has_second_pass and run_second_pass) or (
-                        is_selflift and selflift_low_latent is not None
-                    ):
-                        low_context_images = graph.node(
-                            "VAEDecode",
-                            id=f"low_context_video_decode_{task_index}",
-                            samples=low_stage_context_latent,
-                            vae=vae,
-                        )
-                        low_context_audio = graph.node(
-                            "VAEDecodeAudio",
-                            id=f"low_context_audio_decode_{task_index}",
-                            samples=low_stage_context_latent,
-                            vae=audio_vae,
-                        )
-                        low_context_media = graph.node(
-                            "easy h3ContextMediaTrim",
-                            id=f"low_context_trim_{task_index}",
-                            images=low_context_images.out(0),
-                            audio=low_context_audio.out(0),
-                            trim_frames=(
-                                first_pass_context_trim_frames
-                                if first_pass_context_trim_frames is not None
-                                else 0
-                            ),
-                            output_frames=base_task_length,
-                            **(
-                                {"fit_video_duration": True}
-                                if fit_locked_video_timing
-                                else {}
-                            ),
-                            fps=fps,
-                        )
-                        low_delivered_images = low_context_media.out(0)
-                        project_low_context_latent = _h3_encode_context_media(
-                            graph,
-                            low_context_media.out(0),
-                            low_context_media.out(1),
-                            vae,
-                            audio_vae,
-                            f"low_context_{task_index}",
-                        )
-                        low_context_reencoded = True
-                    else:
-                        project_low_context_latent = project_hires_context_latent
-                        low_context_reencoded = hires_context_reencoded
-                report_segment_step(0.89)
-                # Keep decoded audio for latent continuity, but deliver the original
-                # task audio in the video so the project needs no separate WAV.
-                saved_video = graph.node(
-                    "easy saveVideo",
-                    id=f"save_video_{task_index}",
-                    input_mode="images+audio",
-                    **{
-                        "input_mode.images": output_images,
-                        "input_mode.audio": saved_audio,
-                        "input_mode.fps": fps,
-                        "output_mode": "hide&save",
-                    },
-                    filename_prefix=(
-                        f"easy_media/projects/{safe_project_name}/"
-                        f".staging_video_{task_index}"
-                    ),
-                )
-                saved_video_end = graph.node(
-                    "easy h3SegmentSaveEnd",
-                    id=f"save_end_{task_index}",
-                    video_path=saved_video.out(1),
-                    project_name=safe_project_name,
-                    segment_index=task_index,
-                )
-                saved_media_inputs = {"video_path": saved_video_end.out(0)}
-
-            previous_reference_frame = output_images if not audio_only else None
-            saved_hires_context_latent = project_hires_context_latent
-            saved_low_context_latent = project_low_context_latent
-            hires_trim_inputs: dict[str, Any] = {
-                "latent": saved_hires_context_latent,
-                "context_length": str(context_source_frames),
-            }
-            if not audio_only and not hires_context_reencoded:
-                hires_trim_inputs.update({"anchor_images": output_images, "vae": vae})
-            runtime_hires_context_latent = graph.node(
-                "easy h3MotionContextLatentTrim",
-                id=f"trim_hires_context_latent_{task_index}",
-                **hires_trim_inputs,
-            ).out(0)
-            if has_second_pass or is_selflift:
-                low_trim_inputs: dict[str, Any] = {
-                    "latent": saved_low_context_latent,
-                    "context_length": str(context_source_frames),
-                }
-                if not audio_only and not low_context_reencoded:
-                    low_anchor_images = low_delivered_images
-                    if low_anchor_images is None:
-                        if (has_second_pass and run_second_pass) or (
-                            is_selflift and selflift_low_latent is not None
-                        ):
-                            low_anchor_images = graph.node(
-                                "VAEDecode",
-                                id=f"low_anchor_decode_video_{task_index}",
-                                samples=low_stage_context_latent,
-                                vae=vae,
-                            ).out(0)
-                        else:
-                            low_anchor_images = output_images
-                    low_trim_inputs.update(
-                        {"anchor_images": low_anchor_images, "vae": vae}
-                    )
-                runtime_low_context_latent = graph.node(
-                    "easy h3MotionContextLatentTrim",
-                    id=f"trim_low_context_latent_{task_index}",
-                    **low_trim_inputs,
-                ).out(0)
-            else:
-                runtime_low_context_latent = runtime_hires_context_latent
-            completed_sampling_pass = (
-                "first"
-                if first_pass_only and has_second_pass
-                else "second"
-                if has_second_pass
-                else "single"
-            )
-            # A pass-two resume needs the full sampled span, while continuity
-            # uses the re-encoded delivered span (also saved as low context).
-            checkpoint_latent = (
-                first_pass_latent if preserve_source_timing else saved_hires_context_latent
-            )
-            artifact_inputs: dict[str, Any] = {
-                "project_name": safe_project_name,
-                "project_save": project_save,
-                "segment_index": task_index,
-                "context_latent": (
-                    checkpoint_latent
-                    if completed_sampling_pass == "first"
-                    else runtime_hires_context_latent
-                ),
-                **saved_media_inputs,
-                "tracks_info": output_info,
-                "continuity_mode": continuity_mode,
-                "seed": first_pass_seed,
-                "sampling_pass": completed_sampling_pass,
-            }
-            if has_second_pass or is_selflift:
-                artifact_inputs["context_latent_low"] = (
-                    saved_low_context_latent
-                    if completed_sampling_pass == "first"
-                    else runtime_low_context_latent
-                )
-            if previous_artifact is not None:
-                artifact_inputs["previous"] = previous_artifact
-            report_segment_step(0.95)
-            artifact = graph.node(
-                "easy h3ProjectArtifact",
-                id=f"artifact_{task_index}",
-                **artifact_inputs,
-            )
-            previous_artifact = artifact.out(0)
-            last_project_output = artifact.out(0)
-            previous_hires_context_latent = runtime_hires_context_latent
-            previous_low_context_latent = runtime_low_context_latent
-            segment_nodes.update({
-                node_id: task_index
-                for node_id in graph.nodes.keys() - previous_graph_nodes
-            })
-            report_segment_step(1.0)
-
-        if last_project_output is None:
-            log_node_info(node_name, "Project graph produced no task output")
-            raise RuntimeError("H3 project graph produced no task output")
-        report_step(100)
+    @classmethod
+    def execute(
+        cls,
+        tracks_info: dict,
+        prompt_count: int,
+        **kwargs: object,
+    ) -> io.NodeOutput:
+        prompts = [str(kwargs.pop(f"prompt_{index}", "")) for index in range(prompt_count)]
+        images_out = kwargs.pop("images", None)
+        audio_out = kwargs.pop("audio", None)
+        video_out = kwargs.pop("video", None)
+        final_tracks_info = _apply_multitrack_enhanced_prompts_to_field(tracks_info, prompts)
+        project_output = _scene_studio_render(cls, tracks_info=final_tracks_info, **kwargs)
         return io.NodeOutput(
-            last_project_output,
-            full_locked_audio,
-            expand=_timed_h3_project_graph(graph, safe_project_name, segment_nodes),
+            final_tracks_info,
+            images_out,
+            audio_out,
+            video_out,
+            project_output[0],
+            project_output[1],
+            expand=project_output.expand,
         )
 
 

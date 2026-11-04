@@ -44,6 +44,12 @@ from .utils.h3_project import (
     safe_h3_project_name,
     select_h3_project_video,
 )
+from .utils.scenes import (
+    delete_scene,
+    list_scenes,
+    load_scene,
+    save_scene,
+)
 from .utils.models import (
     MissingEasyMediaModelError,
     download_model,
@@ -132,6 +138,58 @@ async def handle_delete_h3_project(request: web.Request) -> web.Response:
     except Exception as error:
         traceback.print_exc()
         return web.json_response({"error": f"Failed to delete H3 project: {error}"}, status=500)
+
+
+@PromptServer.instance.routes.get("/easy-media/scenes")
+async def handle_scenes(_request: web.Request) -> web.Response:
+    try:
+        return web.json_response({"scenes": list_scenes()})
+    except Exception as error:
+        traceback.print_exc()
+        return web.json_response({"error": f"Failed to list scenes: {error}"}, status=500)
+
+
+@PromptServer.instance.routes.get("/easy-media/scene")
+async def handle_scene(request: web.Request) -> web.Response:
+    scene_name = request.rel_url.query.get("scene_name", "")
+    try:
+        return web.json_response(load_scene(scene_name))
+    except (FileNotFoundError, TypeError, ValueError) as error:
+        return web.json_response({"error": str(error)}, status=404)
+    except Exception as error:
+        traceback.print_exc()
+        return web.json_response({"error": f"Failed to load scene: {error}"}, status=500)
+
+
+@PromptServer.instance.routes.post("/easy-media/scene")
+async def handle_save_scene(request: web.Request) -> web.Response:
+    try:
+        payload = await request.json()
+        scene_name = payload.get("scene_name")
+        track_data = payload.get("track_data")
+        if not isinstance(scene_name, str) or not isinstance(track_data, dict):
+            raise ValueError("scene_name must be a string and track_data must be an object")
+        safe_name = save_scene(scene_name, track_data)
+        return web.json_response({"scene_name": safe_name})
+    except (TypeError, ValueError) as error:
+        return web.json_response({"error": str(error)}, status=400)
+    except Exception as error:
+        traceback.print_exc()
+        return web.json_response({"error": f"Failed to save scene: {error}"}, status=500)
+
+
+@PromptServer.instance.routes.delete("/easy-media/scene")
+async def handle_delete_scene(request: web.Request) -> web.Response:
+    scene_name = request.rel_url.query.get("scene_name", "")
+    try:
+        safe_name = safe_h3_project_name(scene_name)
+        deleted = delete_scene(safe_name)
+        return web.json_response({"scene_name": safe_name, "deleted": deleted})
+    except (TypeError, ValueError) as error:
+        return web.json_response({"error": str(error)}, status=400)
+    except Exception as error:
+        traceback.print_exc()
+        return web.json_response({"error": f"Failed to delete scene: {error}"}, status=500)
 
 
 @PromptServer.instance.routes.delete("/easy-media/project/video")

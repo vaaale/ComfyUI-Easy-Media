@@ -1,10 +1,11 @@
-const TIMELINE_NODE_NAME = new Set(['easy timelineEditor', 'easy multiTrackEditor'])
+const TIMELINE_NODE_NAME = new Set(['easy timelineEditor', 'easy multiTrackEditor', 'easy sceneStudio'])
 const TIMELINE_HEIGHT_PROPERTY = 'easyMediaTimelineHeight'
 const TIMELINE_WIDGET_RESIZE_GUARD = '__easyMediaTimelineWidgetResizeGuard'
 const TIMELINE_HEIGHT_RESTORE_VERSION = '__easyMediaTimelineHeightRestoreVersion'
 const TIMELINE_WIDGET_DEFAULT_SIZES: Record<string, [number, number]> = {
   'easy timelineEditor': [520, 430],
   'easy multiTrackEditor': [800, 700],
+  'easy sceneStudio': [800, 700],
 }
 const WIDGET_RESIZE_GUARD_MS = 500
 

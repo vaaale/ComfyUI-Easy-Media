@@ -6,6 +6,7 @@ export const EASY_MEDIA_SYNC_PLAY_NODE_TYPES = new Set([
   'easy compareVideos',
   'easy multiTrackEditor',
   'easy multitrackProjectVideoCombine',
+  'easy sceneStudio',
 ])
 
 export const EASY_MEDIA_SYNC_PLAY_MENU_LABEL_KEY = 'common.syncPlay'
@@ -92,6 +93,7 @@ const SYNC_PLAY_AUDIO_PRIORITY: Readonly<Record<string, number>> = {
   'easy saveVideo': 0,
   'easy multitrackProjectVideoCombine': 1,
   'easy multiTrackEditor': 2,
+  'easy sceneStudio': 2,
 }
 
 function nodeType(node: EasyMediaSyncPlayNode): string {

@@ -80,6 +80,7 @@ import { adjustMultiTrackEditorNodeHeight } from '@/lib/timeline-node-size'
 import type { MultiTrack, MultiTrackSegment, MultiTrackSegmentContent, MultiTrackSourceType, MultiTrackTaskImage, MultiTrackType, TrackData } from '@/types/multitrack'
 import { MultiTrackRuler, MULTITRACK_LEFT_GUTTER, MULTITRACK_RIGHT_RESERVE } from './multitrack/MultiTrackRuler'
 import { MultiTrackToolbar } from './multitrack/MultiTrackToolbar'
+import { SceneBar } from './multitrack/SceneBar'
 import { PreviewArea } from './multitrack/PreviewArea'
 import { SplitTaskSegmentDialog } from './multitrack/SplitTaskSegmentDialog'
 import { TrackArea } from './multitrack/TrackArea'
@@ -167,6 +168,7 @@ export function MultiTrackWidget({ value, onChange, app, node }: Readonly<ReactW
   const scaledTimelineWidth = timelineWidth * zoom
   const canvasScale = useCanvasScale(app)
   const resolutionInput = useMultiTrackResolutionInput(node)
+  const isSceneStudio = (node.comfyClass ?? node.type) === 'easy sceneStudio'
   // React's wheel listener can be passive; cancel native scrolling before moving the timeline.
   // useLayoutEffect attaches the non-passive listener before paint so the very first wheel
   // gesture on the timeline is intercepted rather than falling through to native scroll.
@@ -1438,6 +1440,9 @@ export function MultiTrackWidget({ value, onChange, app, node }: Readonly<ReactW
           className="relative flex h-full w-full min-w-0 max-w-full flex-col overflow-hidden rounded text-foreground font-sans text-xs select-none"
           aria-busy={isSmartSplitting || isRecognizingSubtitles}
         >
+          {isSceneStudio && (
+            <SceneBar app={app} value={data} onChange={commitNormalizedTrackChange} />
+          )}
           <PreviewArea
             data={data}
             currentTime={currentTime}

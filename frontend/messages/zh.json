@@ -78,6 +78,24 @@
     "combineQueuedDetail": "项目 {project} 及其下游节点已加入队列。",
     "queueBusy": "当前 ComfyUI 队列仍有任务，请等待队列清空后再手动合并。"
   },
+  "sceneStudio": {
+    "selectScene": "选择场景",
+    "scenePlaceholder": "场景名称",
+    "save": "保存",
+    "delete": "删除",
+    "deleteTitle": "删除场景？",
+    "deleteConfirm": "删除已保存的场景 {name}？此操作无法撤销。",
+    "listFailed": "无法加载场景列表",
+    "loadFailed": "场景加载失败",
+    "saveFailed": "场景保存失败",
+    "deleteFailed": "场景删除失败",
+    "renderSegment": "渲染此片段",
+    "lora": "LoRA",
+    "loraStrength": "LoRA 强度",
+    "noLora": "无",
+    "enhancedPrompt": "增强后的提示词",
+    "copyToUserPrompt": "复制到用户提示词"
+  },
   "samplingPreview": {
     "title": "采样预览",
     "meta": "片段 {segment} · {pass} · {step}/{total}",

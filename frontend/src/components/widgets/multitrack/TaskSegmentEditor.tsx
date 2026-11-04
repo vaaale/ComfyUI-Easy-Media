@@ -10,6 +10,7 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
+import { NumberInput } from '@/components/ui/number-input'
 import { Popover, PopoverAnchor, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import {
@@ -19,6 +20,7 @@ import {
   type ResizablePanelGroupHandle,
 } from '@/components/ui/resizable'
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import { Textarea } from '@/components/ui/textarea'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import { MediaSelector } from '@/components/widgets/mediaSelector/MediaSelector'
 import type { MediaTab } from '@/components/widgets/mediaSelector/MediaSelector'
@@ -220,6 +222,61 @@ async function loadSystemPromptOptions(): Promise<SystemPromptOption[]> {
   return systemPromptOptionsRequest
 }
 
+let cachedLoraOptions: string[] | undefined
+let loraOptionsRequest: Promise<string[]> | null = null
+
+async function loadLoraOptions(): Promise<string[]> {
+  if (cachedLoraOptions) return cachedLoraOptions
+  if (!loraOptionsRequest) {
+    loraOptionsRequest = (async () => {
+      const response = await fetch('/object_info/LoraLoaderModelOnly')
+      if (!response.ok) {
+        throw new Error(`Failed to load LoRA list: ${response.status}`)
+      }
+      const result = await response.json() as Record<string, unknown>
+      const nodeInfo = result.LoraLoaderModelOnly as
+        | { input?: { required?: { lora_name?: [unknown, ...unknown[]] } } }
+        | undefined
+      const rawNames = nodeInfo?.input?.required?.lora_name?.[0]
+      const names = Array.isArray(rawNames)
+        ? rawNames.filter((name): name is string => typeof name === 'string')
+        : []
+      cachedLoraOptions = names
+      return names
+    })().catch((error: unknown) => {
+      loraOptionsRequest = null
+      throw error
+    })
+  }
+  return loraOptionsRequest
+}
+
+interface SceneStudioRenderNodeWidget {
+  name?: string
+  value?: unknown
+  callback?: (value: unknown) => void
+}
+
+interface SceneStudioRenderNode {
+  widgets?: SceneStudioRenderNodeWidget[]
+  setDirtyCanvas?: (fg: boolean, bg?: boolean) => void
+}
+
+function setSiblingWidgetValue(node: SceneStudioRenderNode, name: string, value: unknown): boolean {
+  const widget = node.widgets?.find((candidate) => candidate.name === name)
+  if (!widget) return false
+  widget.value = value
+  widget.callback?.(value)
+  return true
+}
+
+function renderOnlySegment(node: unknown, taskIndex: number) {
+  const target = node as SceneStudioRenderNode
+  const updatedStart = setSiblingWidgetValue(target, 'segment_start_number', taskIndex + 1)
+  const updatedCount = setSiblingWidgetValue(target, 'segment_count', 1)
+  if (updatedStart || updatedCount) target.setDirtyCanvas?.(true, true)
+}
+
 export function TaskSegmentEditor({
   segment,
   node,
@@ -261,6 +318,23 @@ export function TaskSegmentEditor({
   const mode = segment.content.task_mode ?? 'default'
   const continuityMode = segment.content.continuity_mode ?? MULTITRACK_DEFAULT_CONTINUITY_MODE
   const refImageSize = segment.content.ref_image_size ?? MULTITRACK_DEFAULT_REF_IMAGE_SIZE
+  const isSceneStudio = (
+    (node as { comfyClass?: string; type?: string } | undefined)?.comfyClass
+    ?? (node as { comfyClass?: string; type?: string } | undefined)?.type
+  ) === 'easy sceneStudio'
+  const [loraOptions, setLoraOptions] = useState<string[]>(cachedLoraOptions ?? [])
+  useEffect(() => {
+    if (!isSceneStudio || cachedLoraOptions) return
+    let cancelled = false
+    void loadLoraOptions().then((names) => {
+      if (!cancelled) setLoraOptions(names)
+    }).catch((error: unknown) => {
+      console.error('[TaskSegmentEditor] failed to load LoRA list:', error)
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [isSceneStudio])
   const editableSegments = useMemo(() => (
     trackSegments && trackSegments.length > 0 ? trackSegments : [segment]
   ), [segment, trackSegments])
@@ -1149,18 +1223,42 @@ export function TaskSegmentEditor({
               <p className="shrink-0 text-[9px] text-muted-foreground mt-1">{t('maintainTrack.combinedHint')}</p>
             </div>
           ) : promptTab === 'user' ? (
-            <div className="relative h-full min-h-0 flex-1 overflow-hidden pb-2 px-2">
-              <PromptContentEditor
-                placeholder={promptPlaceholder}
-                interactivePlaceholder={usesMiniMaxPromptPlaceholder}
-                ariaLabel={t('multitrack.prompt')}
-                className="border-none bg-card shadow-none"
-                value={promptValue}
-                resources={promptResources}
-                mentionsEnabled
-                highlightPromptSemantics
-                onChange={handlePromptChange}
-              />
+            <div className="relative flex h-full min-h-0 flex-1 gap-2 overflow-hidden pb-2 px-2">
+              <div className="relative h-full min-h-0 flex-1 overflow-hidden">
+                <PromptContentEditor
+                  placeholder={promptPlaceholder}
+                  interactivePlaceholder={usesMiniMaxPromptPlaceholder}
+                  ariaLabel={t('multitrack.prompt')}
+                  className="border-none bg-card shadow-none"
+                  value={promptValue}
+                  resources={promptResources}
+                  mentionsEnabled
+                  highlightPromptSemantics
+                  onChange={handlePromptChange}
+                />
+              </div>
+              {isSceneStudio && (
+                <div className="flex h-full min-h-0 flex-1 flex-col gap-1 overflow-hidden rounded-md bg-card p-1">
+                  <div className="flex shrink-0 items-center justify-between px-1">
+                    <span className="text-[9px] text-muted-foreground">{t('sceneStudio.enhancedPrompt')}</span>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      className="h-5 px-1.5 text-[9px] text-highlight hover:bg-highlight/10 hover:text-highlight cursor-pointer"
+                      disabled={!segment.content.enhanced_prompt?.trim()}
+                      onClick={() => onContentChange({ user_prompt: segment.content.enhanced_prompt ?? '' })}
+                    >
+                      {t('sceneStudio.copyToUserPrompt')}
+                    </Button>
+                  </div>
+                  <Textarea
+                    aria-label={t('sceneStudio.enhancedPrompt')}
+                    className="h-full min-h-0 flex-1 resize-none border-none bg-transparent text-[10px] shadow-none focus-visible:ring-0"
+                    value={segment.content.enhanced_prompt ?? ''}
+                    onChange={(event) => onContentChange({ enhanced_prompt: event.target.value })}
+                  />
+                </div>
+              )}
             </div>
           ) : (
             <div className="relative h-full min-h-0 flex-1 overflow-hidden pb-2 px-2">
@@ -1234,6 +1332,64 @@ export function TaskSegmentEditor({
         </div>
 
         <div className="flex items-center gap-2">
+          {isSceneStudio && (
+            <Select
+              value={segment.content.lora_name ?? '__none__'}
+              onValueChange={(value) => handleDropdownContentChange({
+                lora_name: value === '__none__' ? '' : value,
+              })}
+            >
+              <TooltipProvider delayDuration={300}>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <SelectTrigger aria-label={t('sceneStudio.lora')} className="h-8 w-28 bg-card text-[10px]">
+                      <SelectValue />
+                    </SelectTrigger>
+                  </TooltipTrigger>
+                  <TooltipContent side="bottom" className="max-w-72">
+                    {t('sceneStudio.lora')}
+                  </TooltipContent>
+                </Tooltip>
+              </TooltipProvider>
+              <SelectContent>
+                <SelectItem value="__none__"><span className="text-[10px]">{t('sceneStudio.noLora')}</span></SelectItem>
+                {loraOptions.map((loraName) => (
+                  <SelectItem key={loraName} value={loraName}>
+                    <span className="text-[10px]">{loraName}</span>
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          )}
+          {isSceneStudio && segment.content.lora_name && (
+            <NumberInput
+              aria-label={t('sceneStudio.loraStrength')}
+              className="h-8 w-16 bg-card text-[10px]"
+              min={-10}
+              max={10}
+              step={0.05}
+              value={segment.content.lora_strength ?? 1}
+              onChange={(value) => handleDropdownContentChange({ lora_strength: value })}
+            />
+          )}
+          {isSceneStudio && (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  className="h-8 px-2 text-[10px] cursor-pointer"
+                  onClick={() => renderOnlySegment(node, taskIndex)}
+                >
+                  {t('sceneStudio.renderSegment')}
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent side="bottom" className="max-w-72">
+                {t('sceneStudio.renderSegment')}
+              </TooltipContent>
+            </Tooltip>
+          )}
           {format === 'MiniMax' && mode !== 'passthrough' && (taskIndex > 0 || hasSelectedContinuityTargets) && (
             <Select
               value={continuityMode}

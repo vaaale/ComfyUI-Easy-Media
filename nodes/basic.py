@@ -4231,6 +4231,30 @@ class MultiTrackPromptEnhanceToProjectApply(io.ComfyNode):
         )
 
 
+def _apply_multitrack_enhanced_prompts_to_field(
+    info: dict, prompts: list[str], field: str = "enhanced_prompt",
+) -> dict:
+    """Copy track metadata and write each task segment's enhanced prompt into
+    a dedicated field, leaving user_prompt/user_prompt_b untouched."""
+    output_info = dict(info)
+    output_info["tracks"] = deepcopy(info.get("tracks", []))
+    task_segments = _multitrack_task_segments(output_info)
+    if len(task_segments) != len(prompts):
+        raise ValueError(
+            "Prompt count does not match the number of multitrack task segments."
+        )
+    for segment, prompt in zip(task_segments, prompts):
+        content = segment.get("content")
+        if not isinstance(content, dict):
+            content = {}
+            segment["content"] = content
+        content[field] = str(prompt)
+    return output_info
+
+
+SCENE_STUDIO_PROMPT_APPLY_NODE_ID = "easy sceneStudioPromptApply"
+
+
 class MultiTrackPromptEnhancerImageListBridge(io.ComfyNode):
     @classmethod
     def define_schema(cls) -> io.Schema:

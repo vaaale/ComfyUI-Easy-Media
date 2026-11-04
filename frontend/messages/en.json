@@ -78,6 +78,24 @@
     "combineQueuedDetail": "The {project} project and its downstream nodes were added to the queue.",
     "queueBusy": "Wait until the current ComfyUI queue is empty before combining manually."
   },
+  "sceneStudio": {
+    "selectScene": "Select scene",
+    "scenePlaceholder": "Scene name",
+    "save": "Save",
+    "delete": "Delete",
+    "deleteTitle": "Delete scene?",
+    "deleteConfirm": "Delete the saved scene {name}? This cannot be undone.",
+    "listFailed": "Could not load scenes",
+    "loadFailed": "Scene load failed",
+    "saveFailed": "Scene save failed",
+    "deleteFailed": "Scene deletion failed",
+    "renderSegment": "Render this segment",
+    "lora": "LoRA",
+    "loraStrength": "LoRA strength",
+    "noLora": "None",
+    "enhancedPrompt": "Enhanced prompt",
+    "copyToUserPrompt": "Copy to user prompt"
+  },
   "samplingPreview": {
     "title": "Sampling preview",
     "meta": "Segment {segment} · {pass} · {step}/{total}",

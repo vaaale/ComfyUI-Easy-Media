@@ -51,6 +51,9 @@ export interface MultiTrackSegmentContent {
   task_mode?: MultiTrackTaskMode
   continuity_mode?: MultiTrackContinuityMode
   ref_image_size?: MultiTrackRefImageSize
+  lora_name?: string
+  lora_strength?: number
+  enhanced_prompt?: string
   images?: MultiTrackTaskImage[]
   duration?: number
   volume_db?: number
