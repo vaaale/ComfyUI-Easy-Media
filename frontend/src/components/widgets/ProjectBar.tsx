@@ -63,9 +63,9 @@ export function ProjectBar({ app, value, onChange }: Readonly<ReactWidgetProps<P
 
   return (
     <TooltipProvider delayDuration={300}>
-      <div className="flex h-8 min-h-8 w-full shrink-0 items-center gap-1.5 overflow-hidden px-1.5 text-[10px]">
+      <div className="flex w-full shrink-0 flex-wrap items-center gap-1.5 px-1.5 py-1 text-[10px]">
         <Select onOpenChange={(open) => { if (open) void loadProjects() }} onValueChange={selectProject} value={projectName}>
-          <SelectTrigger className="h-6 w-28 text-xs" aria-label={t('sceneStudio.selectProject')}>
+          <SelectTrigger className="h-6 w-28 shrink-0 text-xs" aria-label={t('sceneStudio.selectProject')}>
             <SelectValue placeholder={t('sceneStudio.selectProject')} />
           </SelectTrigger>
           <SelectContent>{projects.map((name) => <SelectItem key={name} value={name}>{name}</SelectItem>)}</SelectContent>
@@ -74,13 +74,13 @@ export function ProjectBar({ app, value, onChange }: Readonly<ReactWidgetProps<P
           value={newName}
           onChange={(event) => setNewName(event.target.value)}
           placeholder={t('sceneStudio.newProjectPlaceholder')}
-          className="h-6 w-28 text-xs"
+          className="h-6 w-28 shrink-0 text-xs"
         />
         <Button
           type="button"
           variant="outline"
           size="sm"
-          className="h-6 px-2 text-xs"
+          className="h-6 shrink-0 px-2 text-xs"
           disabled={!newName.trim()}
           onClick={createProject}
         >
@@ -88,7 +88,7 @@ export function ProjectBar({ app, value, onChange }: Readonly<ReactWidgetProps<P
         </Button>
         <Tooltip>
           <TooltipTrigger asChild>
-            <label className="ml-auto flex shrink-0 cursor-pointer items-center gap-1.5 text-muted-foreground">
+            <label className="flex shrink-0 cursor-pointer items-center gap-1.5 text-muted-foreground">
               <Checkbox
                 checked={replaceExisting}
                 onCheckedChange={(checked) => onChange({ project_name: projectName, project_save: checked ? 'override' : 'new' })}

@@ -119,10 +119,12 @@ comfyApp.registerExtension({
       PROJECT_REF: createReactWidget<ProjectRef>(ProjectBar, {
         defaultValue: JSON.stringify({ project_name: 'default', project_save: 'new' }),
         keepResponsiveWidthInLiteGraph: true,
-        height: 36,
         domWidgetOptions: {
-          getMinHeight: () => 36,
-          getMaxHeight: () => 36,
+          // Flexible, not pinned: the row wraps to a second line at narrow
+          // zoom levels, and a hard-pinned height would clip that second
+          // line regardless of how the node itself is resized.
+          getMinHeight: () => 32,
+          getMaxHeight: () => 72,
           hideOnZoom: false,
           serialize: true,
         },
