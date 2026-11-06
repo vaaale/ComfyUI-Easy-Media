@@ -1,11 +1,11 @@
-import { useCallback, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import type { ComfyApp } from '@comfyorg/comfyui-frontend-types'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
 import { Input } from '@/components/ui/input'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
-import { getSiblingWidgetValue, setSiblingWidgetValue, type SiblingWidgetNode } from '@/lib/sibling-widget'
+import { getSiblingWidgetValue, hideSiblingWidget, setSiblingWidgetValue, type SiblingWidgetNode } from '@/lib/sibling-widget'
 import { useT } from '@/lib/i18n'
 import type { TrackData } from '@/types/multitrack'
 
@@ -24,6 +24,8 @@ function extractNames(payload: unknown, key: string): string[] {
   return Array.isArray(raw) ? raw.filter((name): name is string => typeof name === 'string' && name.length > 0) : []
 }
 
+const AUTO_SAVE_DEBOUNCE_MS = 1500
+
 interface ProjectBarProps {
   app: ComfyApp
   node: SiblingWidgetNode
@@ -34,20 +36,31 @@ interface ProjectBarProps {
 /**
  * Projects, scenes, LoRAs... too many names for the same thing: this bar
  * treats "project" as the single user-facing concept. Picking or naming a
- * project drives the render-output folder (project_name/project_save native
- * widgets, via the sibling bridge) *and* loads/saves that project's timeline
- * snapshot (reusing the scene JSON storage under the hood).
+ * project drives the render-output folder (project_name/replace_existing_output
+ * native widgets, via the sibling bridge) *and* loads/saves that project's
+ * timeline snapshot (reusing the scene JSON storage under the hood).
  */
 export function ProjectBar({ app, node, value, onChange }: Readonly<ProjectBarProps>) {
   const t = useT()
   const [projects, setProjects] = useState<string[]>(['default'])
   const [nameInput, setNameInput] = useState<string>(() => String(getSiblingWidgetValue(node, 'project_name', '') || 'default'))
   const [isBusy, setIsBusy] = useState(false)
-  const replaceExisting = getSiblingWidgetValue<'new' | 'override'>(node, 'project_save', 'new') === 'override'
+  const replaceExisting = getSiblingWidgetValue<boolean>(node, 'replace_existing_output', false)
 
-  function applyProjectRef(name: string, save: 'new' | 'override') {
+  // project_name/replace_existing_output are real node inputs (used at render
+  // time) but this bar is their only intended UI; hide their native rows so
+  // they don't show twice. Runs once on mount, not reactively, since nothing
+  // else should be toggling their visibility.
+  useEffect(() => {
+    const hiddenName = hideSiblingWidget(node, 'project_name')
+    const hiddenReplace = hideSiblingWidget(node, 'replace_existing_output')
+    if (hiddenName || hiddenReplace) node.setDirtyCanvas?.(true, true)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [node])
+
+  function applyProjectRef(name: string, replace: boolean) {
     setSiblingWidgetValue(node, 'project_name', name)
-    setSiblingWidgetValue(node, 'project_save', save)
+    setSiblingWidgetValue(node, 'replace_existing_output', replace)
     node.setDirtyCanvas?.(true, true)
   }
 
@@ -79,7 +92,7 @@ export function ProjectBar({ app, node, value, onChange }: Readonly<ProjectBarPr
   const selectProject = useCallback(async (name: string) => {
     setIsBusy(true)
     try {
-      applyProjectRef(name, 'new')
+      applyProjectRef(name, false)
       setNameInput(name)
       const response = await app.api.fetchApi(`/easy-media/scene?scene_name=${encodeURIComponent(name)}`)
       if (response.ok) {
@@ -109,20 +122,18 @@ export function ProjectBar({ app, node, value, onChange }: Readonly<ProjectBarPr
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [app, node, onChange, t])
 
-  const saveProject = useCallback(async () => {
-    const name = nameInput.trim()
-    if (!name) return
-    setIsBusy(true)
+  const persistProject = useCallback(async (name: string, trackData: TrackData): Promise<boolean> => {
     try {
       const response = await app.api.fetchApi('/easy-media/scene', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ scene_name: name, track_data: value }),
+        body: JSON.stringify({ scene_name: name, track_data: trackData }),
       })
-      const payload: unknown = await response.json()
-      if (!response.ok) throw new Error(errorMessage(payload, t('sceneStudio.projectSaveFailed')))
-      applyProjectRef(name, 'new')
-      await loadProjects()
+      if (!response.ok) {
+        const payload: unknown = await response.json().catch(() => null)
+        throw new Error(errorMessage(payload, t('sceneStudio.projectSaveFailed')))
+      }
+      return true
     } catch (error) {
       app.extensionManager.toast.add({
         severity: 'error',
@@ -130,11 +141,51 @@ export function ProjectBar({ app, node, value, onChange }: Readonly<ProjectBarPr
         detail: error instanceof Error ? error.message : String(error),
         life: 5000,
       })
+      return false
+    }
+  }, [app, t])
+
+  const saveProject = useCallback(async () => {
+    const name = nameInput.trim()
+    if (!name) return
+    setIsBusy(true)
+    try {
+      if (await persistProject(name, value)) {
+        // Only the name, never project_save: saving the timeline and the
+        // replace-existing-output render setting are unrelated, and this
+        // used to silently discard the user's checkbox choice on every save.
+        setSiblingWidgetValue(node, 'project_name', name)
+        node.setDirtyCanvas?.(true, true)
+        await loadProjects()
+      }
     } finally {
       setIsBusy(false)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [app, loadProjects, nameInput, node, t, value])
+  }, [loadProjects, nameInput, node, persistProject, value])
+
+  // Auto-save edits to the active project after they settle, so adding or
+  // changing segments doesn't require remembering to click Save. Skips the
+  // very first render (nothing has actually changed yet) and any render
+  // where no project name is set.
+  const hasMountedRef = useRef(false)
+  useEffect(() => {
+    if (!hasMountedRef.current) {
+      hasMountedRef.current = true
+      return
+    }
+    const name = nameInput.trim()
+    if (!name) return
+    const timer = globalThis.setTimeout(() => {
+      void persistProject(name, value).then((success) => {
+        if (success) void loadProjects()
+      })
+    }, AUTO_SAVE_DEBOUNCE_MS)
+    return () => globalThis.clearTimeout(timer)
+    // Intentionally keyed on `value` alone: auto-save should fire whenever
+    // the timeline changes, targeting whatever project is currently active.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [value])
 
   const deleteProject = useCallback(async () => {
     const name = nameInput.trim()
@@ -203,7 +254,7 @@ export function ProjectBar({ app, node, value, onChange }: Readonly<ProjectBarPr
             <label className="flex shrink-0 cursor-pointer items-center gap-1.5 text-muted-foreground">
               <Checkbox
                 checked={replaceExisting}
-                onCheckedChange={(checked) => applyProjectRef(nameInput.trim() || 'default', checked ? 'override' : 'new')}
+                onCheckedChange={(checked) => applyProjectRef(nameInput.trim() || 'default', checked === true)}
               />
               {t('sceneStudio.replaceExistingOutput')}
             </label>

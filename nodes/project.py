@@ -2353,7 +2353,6 @@ _SCENE_STUDIO_PROJECT_INPUT_NAMES = (
     "sigmas",
     "sigmas_2nd",
     "project_name",
-    "project_save",
     "segment_start_number",
     "segment_count",
     "seed",
@@ -2504,13 +2503,13 @@ class EasySceneStudio(io.ComfyNode):
                     "Optional second-pass sigmas. "
                 )),
                 io.String.Input("project_name", default=""),
-                io.Combo.Input(
-                    "project_save",
-                    options=["new", "override"],
-                    default="new",
+                io.Boolean.Input(
+                    "replace_existing_output",
+                    default=False,
                     tooltip=(
-                        "'new' preserves existing output; 'override' wipes and "
-                        "re-renders segments from segment_start_number onward."
+                        "When on, wipes and re-renders this project's segments "
+                        "from segment_start_number onward instead of preserving "
+                        "existing output."
                     ),
                 ),
                 io.Int.Input(
@@ -2725,6 +2724,12 @@ class EasySceneStudio(io.ComfyNode):
             for name in _SCENE_STUDIO_PROJECT_INPUT_NAMES
             if name in kwargs
         }
+        # Shared core's project_save is "new"/"override"; this node exposes
+        # the clearer boolean replace_existing_output instead.
+        replace_existing_output = bool(
+            _unwrap_list_scalar(kwargs.get("replace_existing_output"), False)
+        )
+        project_kwargs["project_save"] = "override" if replace_existing_output else "new"
 
         def render(final_tracks_info: dict) -> io.NodeOutput:
             project_output = _scene_studio_render(
