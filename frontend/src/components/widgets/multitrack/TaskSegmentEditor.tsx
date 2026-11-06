@@ -60,6 +60,7 @@ import {
   uploadTaskImageFile,
 } from '@/lib/task-image-utils'
 import { invalidateMediaListCache } from '@/stores/media-list-store'
+import { setSiblingWidgetValue, type SiblingWidgetNode } from '@/lib/sibling-widget'
 import type {
   MultiTrack,
   MultiTrackContinuityMode,
@@ -253,27 +254,8 @@ async function loadLoraOptions(): Promise<string[]> {
   return loraOptionsRequest
 }
 
-interface SceneStudioRenderNodeWidget {
-  name?: string
-  value?: unknown
-  callback?: (value: unknown) => void
-}
-
-interface SceneStudioRenderNode {
-  widgets?: SceneStudioRenderNodeWidget[]
-  setDirtyCanvas?: (fg: boolean, bg?: boolean) => void
-}
-
-function setSiblingWidgetValue(node: SceneStudioRenderNode, name: string, value: unknown): boolean {
-  const widget = node.widgets?.find((candidate) => candidate.name === name)
-  if (!widget) return false
-  widget.value = value
-  widget.callback?.(value)
-  return true
-}
-
 function renderOnlySegment(node: unknown, taskIndex: number) {
-  const target = node as SceneStudioRenderNode
+  const target = node as SiblingWidgetNode
   const updatedStart = setSiblingWidgetValue(target, 'segment_start_number', taskIndex + 1)
   const updatedCount = setSiblingWidgetValue(target, 'segment_count', 1)
   if (updatedStart || updatedCount) target.setDirtyCanvas?.(true, true)

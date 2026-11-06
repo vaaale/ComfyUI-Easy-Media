@@ -79,16 +79,8 @@
     "queueBusy": "Wait until the current ComfyUI queue is empty before combining manually."
   },
   "sceneStudio": {
-    "selectScene": "Select scene",
-    "scenePlaceholder": "Scene name",
     "save": "Save",
     "delete": "Delete",
-    "deleteTitle": "Delete scene?",
-    "deleteConfirm": "Delete the saved scene {name}? This cannot be undone.",
-    "listFailed": "Could not load scenes",
-    "loadFailed": "Scene load failed",
-    "saveFailed": "Scene save failed",
-    "deleteFailed": "Scene deletion failed",
     "renderSegment": "Render this segment",
     "lora": "LoRA",
     "loraStrength": "LoRA strength",
@@ -100,10 +92,16 @@
     "copyToUserPrompt": "Copy to user prompt",
     "selectProject": "Select project",
     "newProjectPlaceholder": "New project name",
-    "createProject": "Create",
     "replaceExistingOutput": "Replace existing output",
     "replaceExistingOutputTooltip": "When on, rendering wipes and re-renders this project's segments from segment_start_number onward instead of preserving what's already there.",
-    "projectListFailed": "Could not load projects"
+    "projectListFailed": "Could not load projects",
+    "projectLoadFailed": "Project load failed",
+    "projectSaveFailed": "Project save failed",
+    "projectDeleteFailed": "Project deletion failed",
+    "deleteProjectTitle": "Delete saved timeline?",
+    "deleteProjectConfirm": "Delete the saved timeline for project {name}? This does not delete any rendered output, only the editable segment data. This cannot be undone.",
+    "noSavedTimelineTitle": "No saved timeline",
+    "noSavedTimelineDetail": "Project {name} has no saved timeline yet — the current one was kept as-is. Click Save to create one."
   },
   "samplingPreview": {
     "title": "Sampling preview",

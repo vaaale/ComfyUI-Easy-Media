@@ -71,7 +71,6 @@ TYPE_FAST_MODEL_LOADER = io.Custom(io_type="FAST_MODEL_LOADER")
 TYPE_TRACKS_INFO = io.Custom(io_type="TRACKS_INFO")
 TYPE_PROJECT_DATA = io.Custom(io_type="PROJECT_DATA")
 TYPE_H3_PROJECT_STATIC_DATA = io.Custom(io_type="H3_PROJECT_STATIC_DATA")
-TYPE_PROJECT_REF = io.Custom(io_type="PROJECT_REF")
 H3_CONTEXT_CONTINUITY_MODES = {"context", "context_drift", "context_swap"}
 H3_CONTEXT_SOURCE_FRAMES = 22
 
@@ -2353,6 +2352,8 @@ _SCENE_STUDIO_PROJECT_INPUT_NAMES = (
     "sampler_2nd",
     "sigmas",
     "sigmas_2nd",
+    "project_name",
+    "project_save",
     "segment_start_number",
     "segment_count",
     "seed",
@@ -2398,23 +2399,6 @@ def _scene_studio_enhancer_config(value: Any) -> tuple[bool, dict]:
         raise TypeError("enhancer_enabled must be a DynamicCombo configuration dictionary")
     enabled = str(_first_input(config.get("enhancer_enabled"), "false")).lower() == "true"
     return enabled, config
-
-
-def _scene_studio_project_ref(value: Any) -> tuple[str, str]:
-    """Resolve the project_ref widget into (project_name, project_save)."""
-    ref = _unwrap_list_scalar(value, {})
-    if isinstance(ref, str):
-        try:
-            ref = json.loads(ref)
-        except (TypeError, ValueError):
-            ref = {}
-    if not isinstance(ref, dict):
-        ref = {}
-    project_name = str(ref.get("project_name") or "default")
-    project_save = str(ref.get("project_save") or "new")
-    if project_save not in {"new", "override"}:
-        project_save = "new"
-    return project_name, project_save
 
 
 def _scene_studio_render(cls, *, tracks_info: dict, **project_kwargs: Any) -> io.NodeOutput:
@@ -2519,13 +2503,14 @@ class EasySceneStudio(io.ComfyNode):
                 io.Sigmas.Input("sigmas_2nd", optional=True, raw_link=True, lazy=True, tooltip=(
                     "Optional second-pass sigmas. "
                 )),
-                TYPE_PROJECT_REF.Input(
-                    "project_ref",
+                io.String.Input("project_name", default=""),
+                io.Combo.Input(
+                    "project_save",
+                    options=["new", "override"],
+                    default="new",
                     tooltip=(
-                        "Project folder to render into. Pick an existing project "
-                        "to resume it, or create a new one. 'Replace existing "
-                        "output' wipes and re-renders segments from "
-                        "segment_start_number onward instead of preserving them."
+                        "'new' preserves existing output; 'override' wipes and "
+                        "re-renders segments from segment_start_number onward."
                     ),
                 ),
                 io.Int.Input(
@@ -2740,9 +2725,6 @@ class EasySceneStudio(io.ComfyNode):
             for name in _SCENE_STUDIO_PROJECT_INPUT_NAMES
             if name in kwargs
         }
-        project_name, project_save = _scene_studio_project_ref(kwargs.get("project_ref"))
-        project_kwargs["project_name"] = project_name
-        project_kwargs["project_save"] = project_save
 
         def render(final_tracks_info: dict) -> io.NodeOutput:
             project_output = _scene_studio_render(

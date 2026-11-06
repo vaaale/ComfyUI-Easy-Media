@@ -11,7 +11,6 @@ import type { TrackData } from '@/types/multitrack'
 import type { ImageData } from '@/components/widgets/MultiImagesLoaderWidget'
 import type { CompareVideoSettings } from '@/components/widgets/compareVideoWidget'
 import type { ProjectData } from '@/types/project'
-import type { ProjectRef } from '@/components/widgets/ProjectBar'
 import { DEFAULT_PROJECT_DATA } from '@/types/project'
 import { suppressCompareVideoDefaultPreview } from '@/lib/compare-video-node'
 import { installWorkflowSubmission } from '@/lib/workflow-submission'
@@ -26,7 +25,7 @@ declare global {
 
 const [
   { createReactWidget },
-  { TimelineWidget, MultiTrackWidget, MultiImagesLoaderWidget, CompareVideoWidget, PromptEnhancerAccountWidget, ProjectVideoCombineWidget, ProjectBar },
+  { TimelineWidget, MultiTrackWidget, MultiImagesLoaderWidget, CompareVideoWidget, PromptEnhancerAccountWidget, ProjectVideoCombineWidget },
   { createDefaultTimelineData },
   { createDefaultTrackData },
 ] = await Promise.all([
@@ -112,19 +111,6 @@ comfyApp.registerExtension({
         keepResponsiveWidthInLiteGraph: true,
         domWidgetOptions: {
           getMinHeight: () => 360,
-          hideOnZoom: false,
-          serialize: true,
-        },
-      }),
-      PROJECT_REF: createReactWidget<ProjectRef>(ProjectBar, {
-        defaultValue: JSON.stringify({ project_name: 'default', project_save: 'new' }),
-        keepResponsiveWidthInLiteGraph: true,
-        domWidgetOptions: {
-          // Flexible, not pinned: the row wraps to a second line at narrow
-          // zoom levels, and a hard-pinned height would clip that second
-          // line regardless of how the node itself is resized.
-          getMinHeight: () => 32,
-          getMaxHeight: () => 72,
           hideOnZoom: false,
           serialize: true,
         },

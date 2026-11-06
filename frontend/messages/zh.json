@@ -79,16 +79,8 @@
     "queueBusy": "当前 ComfyUI 队列仍有任务，请等待队列清空后再手动合并。"
   },
   "sceneStudio": {
-    "selectScene": "选择场景",
-    "scenePlaceholder": "场景名称",
     "save": "保存",
     "delete": "删除",
-    "deleteTitle": "删除场景？",
-    "deleteConfirm": "删除已保存的场景 {name}？此操作无法撤销。",
-    "listFailed": "无法加载场景列表",
-    "loadFailed": "场景加载失败",
-    "saveFailed": "场景保存失败",
-    "deleteFailed": "场景删除失败",
     "renderSegment": "渲染此片段",
     "lora": "LoRA",
     "loraStrength": "LoRA 强度",
@@ -100,10 +92,16 @@
     "copyToUserPrompt": "复制到用户提示词",
     "selectProject": "选择项目",
     "newProjectPlaceholder": "新项目名称",
-    "createProject": "创建",
     "replaceExistingOutput": "替换现有输出",
     "replaceExistingOutputTooltip": "开启后，渲染会清除并重新生成该项目从 segment_start_number 起的片段，而不是保留已有内容。",
-    "projectListFailed": "无法加载项目列表"
+    "projectListFailed": "无法加载项目列表",
+    "projectLoadFailed": "项目加载失败",
+    "projectSaveFailed": "项目保存失败",
+    "projectDeleteFailed": "项目删除失败",
+    "deleteProjectTitle": "删除已保存的时间线？",
+    "deleteProjectConfirm": "删除项目 {name} 已保存的时间线？此操作不会删除任何已渲染的输出，仅删除可编辑的片段数据。此操作无法撤销。",
+    "noSavedTimelineTitle": "没有已保存的时间线",
+    "noSavedTimelineDetail": "项目 {name} 尚无已保存的时间线——当前时间线保持不变。点击保存以创建一个。"
   },
   "samplingPreview": {
     "title": "采样预览",

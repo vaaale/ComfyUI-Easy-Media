@@ -80,7 +80,7 @@ import { adjustMultiTrackEditorNodeHeight } from '@/lib/timeline-node-size'
 import type { MultiTrack, MultiTrackSegment, MultiTrackSegmentContent, MultiTrackSourceType, MultiTrackTaskImage, MultiTrackType, TrackData } from '@/types/multitrack'
 import { MultiTrackRuler, MULTITRACK_LEFT_GUTTER, MULTITRACK_RIGHT_RESERVE } from './multitrack/MultiTrackRuler'
 import { MultiTrackToolbar } from './multitrack/MultiTrackToolbar'
-import { SceneBar } from './multitrack/SceneBar'
+import { ProjectBar } from './multitrack/ProjectBar'
 import { PreviewArea } from './multitrack/PreviewArea'
 import { SplitTaskSegmentDialog } from './multitrack/SplitTaskSegmentDialog'
 import { TrackArea } from './multitrack/TrackArea'
@@ -1441,7 +1441,7 @@ export function MultiTrackWidget({ value, onChange, app, node }: Readonly<ReactW
           aria-busy={isSmartSplitting || isRecognizingSubtitles}
         >
           {isSceneStudio && (
-            <SceneBar app={app} value={data} onChange={commitNormalizedTrackChange} />
+            <ProjectBar app={app} node={node} value={data} onChange={commitNormalizedTrackChange} />
           )}
           <PreviewArea
             data={data}
