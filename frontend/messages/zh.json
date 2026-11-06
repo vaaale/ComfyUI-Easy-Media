@@ -82,6 +82,7 @@
     "save": "保存",
     "delete": "删除",
     "renderSegment": "渲染此片段",
+    "renderSegmentFailed": "无法加入渲染队列",
     "lora": "LoRA",
     "loraStrength": "LoRA 强度",
     "addLora": "添加 LoRA",

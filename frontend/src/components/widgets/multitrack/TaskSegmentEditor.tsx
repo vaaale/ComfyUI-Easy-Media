@@ -254,11 +254,41 @@ async function loadLoraOptions(): Promise<string[]> {
   return loraOptionsRequest
 }
 
-function renderOnlySegment(node: unknown, taskIndex: number) {
+interface QueueableApp {
+  queuePrompt: (number: number, batchCount?: number) => Promise<unknown>
+  extensionManager?: {
+    toast?: {
+      add: (options: { severity: string; summary: string; detail?: string; life?: number }) => void
+    }
+  }
+}
+
+async function renderOnlySegment(
+  node: unknown,
+  app: unknown,
+  taskIndex: number,
+  t: (key: string) => string,
+) {
   const target = node as SiblingWidgetNode
+  // segment_count=1 only renders the one segment; the backend only clears
+  // other saved segments when segment_count is -1, so the rest of the
+  // project's output is never touched by this.
   const updatedStart = setSiblingWidgetValue(target, 'segment_start_number', taskIndex + 1)
   const updatedCount = setSiblingWidgetValue(target, 'segment_count', 1)
   if (updatedStart || updatedCount) target.setDirtyCanvas?.(true, true)
+
+  const queueableApp = app as Partial<QueueableApp> | undefined
+  if (typeof queueableApp?.queuePrompt !== 'function') return
+  try {
+    await queueableApp.queuePrompt(0, 1)
+  } catch (error) {
+    queueableApp.extensionManager?.toast?.add({
+      severity: 'error',
+      summary: t('sceneStudio.renderSegmentFailed'),
+      detail: error instanceof Error ? error.message : String(error),
+      life: 5000,
+    })
+  }
 }
 
 export function TaskSegmentEditor({
@@ -1431,7 +1461,7 @@ export function TaskSegmentEditor({
                   variant="outline"
                   size="sm"
                   className="h-8 px-2 text-[10px] cursor-pointer"
-                  onClick={() => renderOnlySegment(node, taskIndex)}
+                  onClick={() => void renderOnlySegment(node, app, taskIndex, t)}
                 >
                   {t('sceneStudio.renderSegment')}
                 </Button>

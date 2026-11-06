@@ -82,6 +82,7 @@
     "save": "Save",
     "delete": "Delete",
     "renderSegment": "Render this segment",
+    "renderSegmentFailed": "Could not queue this segment",
     "lora": "LoRA",
     "loraStrength": "LoRA strength",
     "addLora": "Add LoRA",
