@@ -97,7 +97,13 @@
     "noLorasFound": "未找到匹配的 LoRA",
     "removeLora": "移除 {name}",
     "enhancedPrompt": "增强后的提示词",
-    "copyToUserPrompt": "复制到用户提示词"
+    "copyToUserPrompt": "复制到用户提示词",
+    "selectProject": "选择项目",
+    "newProjectPlaceholder": "新项目名称",
+    "createProject": "创建",
+    "replaceExistingOutput": "替换现有输出",
+    "replaceExistingOutputTooltip": "开启后，渲染会清除并重新生成该项目从 segment_start_number 起的片段，而不是保留已有内容。",
+    "projectListFailed": "无法加载项目列表"
   },
   "samplingPreview": {
     "title": "采样预览",

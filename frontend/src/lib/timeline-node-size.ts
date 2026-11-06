@@ -7,7 +7,12 @@ const TIMELINE_WIDGET_DEFAULT_SIZES: Record<string, [number, number]> = {
   'easy multiTrackEditor': [800, 700],
   'easy sceneStudio': [800, 700],
 }
-const WIDGET_RESIZE_GUARD_MS = 500
+// Kept short deliberately: long enough to catch a synchronous involuntary
+// resize triggered by the same widget-change event (e.g. a DynamicCombo
+// expanding its sub-fields), but short enough that a deliberate manual
+// drag-resize — which always takes longer than this to even begin — is
+// never mistaken for one and reverted.
+const WIDGET_RESIZE_GUARD_MS = 120
 
 type NodeSize = [number, number]
 type ResizeGuard = { height: number; width?: number; expiresAt: number }
@@ -82,6 +87,11 @@ function restoreHeight(node: any, height: number | null, fallbackWidth?: number)
   const restoreVersion = Number(node?.[TIMELINE_HEIGHT_RESTORE_VERSION]) || 0
   globalThis.setTimeout(() => {
     if ((Number(node?.[TIMELINE_HEIGHT_RESTORE_VERSION]) || 0) !== restoreVersion) return
+    // Always resync the stored height, even when applyHeight() is about to
+    // no-op because node.size already matches: an intervening onResize call
+    // (e.g. ComfyUI's own default-size pass) can otherwise leave the stored
+    // property pointing at a stale height despite node.size being correct.
+    preserveHeight(node, height)
     applyHeight(node, height, fallbackWidth)
   }, 100)
 }
@@ -132,9 +142,16 @@ export function preserveTimelineEditorNodeSize(nodeType: any, nodeData: { name?:
   nodeType.prototype.onConfigure = function (serialisedNode: any) {
     originalOnConfigure?.call(this, serialisedNode)
     const savedHeight = readStoredHeight(this, serialisedNode)
+    const fallbackWidth = readSize(serialisedNode?.size)?.[0]
     invalidatePendingHeightRestores(this)
-    if (savedHeight !== null) preserveHeight(this, savedHeight)
-    restoreHeight(this, savedHeight, readSize(serialisedNode?.size)?.[0])
+    if (savedHeight !== null) {
+      preserveHeight(this, savedHeight)
+      // Apply immediately too: onNodeCreated already stamped a default size
+      // moments earlier, and the DOM widget's height can be measured before
+      // the deferred restoreHeight() below fires, locking in the wrong value.
+      applyHeight(this, savedHeight, fallbackWidth)
+    }
+    restoreHeight(this, savedHeight, fallbackWidth)
   }
 
   nodeType.prototype.onResize = function (size: unknown) {

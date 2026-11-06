@@ -97,7 +97,13 @@
     "noLorasFound": "No matching LoRAs",
     "removeLora": "Remove {name}",
     "enhancedPrompt": "Enhanced prompt",
-    "copyToUserPrompt": "Copy to user prompt"
+    "copyToUserPrompt": "Copy to user prompt",
+    "selectProject": "Select project",
+    "newProjectPlaceholder": "New project name",
+    "createProject": "Create",
+    "replaceExistingOutput": "Replace existing output",
+    "replaceExistingOutputTooltip": "When on, rendering wipes and re-renders this project's segments from segment_start_number onward instead of preserving what's already there.",
+    "projectListFailed": "Could not load projects"
   },
   "samplingPreview": {
     "title": "Sampling preview",

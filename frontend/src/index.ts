@@ -11,11 +11,11 @@ import type { TrackData } from '@/types/multitrack'
 import type { ImageData } from '@/components/widgets/MultiImagesLoaderWidget'
 import type { CompareVideoSettings } from '@/components/widgets/compareVideoWidget'
 import type { ProjectData } from '@/types/project'
+import type { ProjectRef } from '@/components/widgets/ProjectBar'
 import { DEFAULT_PROJECT_DATA } from '@/types/project'
 import { suppressCompareVideoDefaultPreview } from '@/lib/compare-video-node'
 import { installWorkflowSubmission } from '@/lib/workflow-submission'
 import { installProjectSamplingPreview } from '@/lib/project-sampling-preview-node'
-import { installSceneStudioWidgetToggle } from '@/lib/scene-studio-widget-toggle'
 
 declare const __COMFY_EASY_MEDIA_GLOBAL_CSS__: string;
 
@@ -26,7 +26,7 @@ declare global {
 
 const [
   { createReactWidget },
-  { TimelineWidget, MultiTrackWidget, MultiImagesLoaderWidget, CompareVideoWidget, PromptEnhancerAccountWidget, ProjectVideoCombineWidget },
+  { TimelineWidget, MultiTrackWidget, MultiImagesLoaderWidget, CompareVideoWidget, PromptEnhancerAccountWidget, ProjectVideoCombineWidget, ProjectBar },
   { createDefaultTimelineData },
   { createDefaultTrackData },
 ] = await Promise.all([
@@ -66,7 +66,6 @@ comfyApp.registerExtension({
     installEasyMediaSyncPlay(nodeType, nodeData)
     suppressCompareVideoDefaultPreview(nodeType, nodeData)
     installProjectSamplingPreview(nodeType, nodeData, comfyApp)
-    installSceneStudioWidgetToggle(nodeType, nodeData)
   },
 
   getNodeMenuItems(node) {
@@ -113,6 +112,17 @@ comfyApp.registerExtension({
         keepResponsiveWidthInLiteGraph: true,
         domWidgetOptions: {
           getMinHeight: () => 360,
+          hideOnZoom: false,
+          serialize: true,
+        },
+      }),
+      PROJECT_REF: createReactWidget<ProjectRef>(ProjectBar, {
+        defaultValue: JSON.stringify({ project_name: 'default', project_save: 'new' }),
+        keepResponsiveWidthInLiteGraph: true,
+        height: 36,
+        domWidgetOptions: {
+          getMinHeight: () => 36,
+          getMaxHeight: () => 36,
           hideOnZoom: false,
           serialize: true,
         },

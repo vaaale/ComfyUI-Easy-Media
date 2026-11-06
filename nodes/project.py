@@ -71,6 +71,7 @@ TYPE_FAST_MODEL_LOADER = io.Custom(io_type="FAST_MODEL_LOADER")
 TYPE_TRACKS_INFO = io.Custom(io_type="TRACKS_INFO")
 TYPE_PROJECT_DATA = io.Custom(io_type="PROJECT_DATA")
 TYPE_H3_PROJECT_STATIC_DATA = io.Custom(io_type="H3_PROJECT_STATIC_DATA")
+TYPE_PROJECT_REF = io.Custom(io_type="PROJECT_REF")
 H3_CONTEXT_CONTINUITY_MODES = {"context", "context_drift", "context_swap"}
 H3_CONTEXT_SOURCE_FRAMES = 22
 
@@ -2352,8 +2353,6 @@ _SCENE_STUDIO_PROJECT_INPUT_NAMES = (
     "sampler_2nd",
     "sigmas",
     "sigmas_2nd",
-    "project_name",
-    "project_save",
     "segment_start_number",
     "segment_count",
     "seed",
@@ -2386,6 +2385,36 @@ def _scene_studio_lora_resolver(content: dict) -> list[tuple[str, float]]:
             strength = 1.0
         resolved.append((lora_name, strength))
     return resolved
+
+
+def _scene_studio_enhancer_config(value: Any) -> tuple[bool, dict]:
+    """Resolve the enhancer_enabled DynamicCombo into (enabled, nested_config)."""
+    config = _first_input(value)
+    if config is None:
+        return False, {}
+    if isinstance(config, str):
+        return config.lower() == "true", {}
+    if not isinstance(config, dict):
+        raise TypeError("enhancer_enabled must be a DynamicCombo configuration dictionary")
+    enabled = str(_first_input(config.get("enhancer_enabled"), "false")).lower() == "true"
+    return enabled, config
+
+
+def _scene_studio_project_ref(value: Any) -> tuple[str, str]:
+    """Resolve the project_ref widget into (project_name, project_save)."""
+    ref = _unwrap_list_scalar(value, {})
+    if isinstance(ref, str):
+        try:
+            ref = json.loads(ref)
+        except (TypeError, ValueError):
+            ref = {}
+    if not isinstance(ref, dict):
+        ref = {}
+    project_name = str(ref.get("project_name") or "default")
+    project_save = str(ref.get("project_save") or "new")
+    if project_save not in {"new", "override"}:
+        project_save = "new"
+    return project_name, project_save
 
 
 def _scene_studio_render(cls, *, tracks_info: dict, **project_kwargs: Any) -> io.NodeOutput:
@@ -2490,11 +2519,14 @@ class EasySceneStudio(io.ComfyNode):
                 io.Sigmas.Input("sigmas_2nd", optional=True, raw_link=True, lazy=True, tooltip=(
                     "Optional second-pass sigmas. "
                 )),
-                io.String.Input("project_name", default=""),
-                io.Combo.Input(
-                    "project_save",
-                    options=["new", "override"],
-                    default="override",
+                TYPE_PROJECT_REF.Input(
+                    "project_ref",
+                    tooltip=(
+                        "Project folder to render into. Pick an existing project "
+                        "to resume it, or create a new one. 'Replace existing "
+                        "output' wipes and re-renders segments from "
+                        "segment_start_number onward instead of preserving them."
+                    ),
                 ),
                 io.Int.Input(
                     "segment_start_number",
@@ -2613,14 +2645,6 @@ class EasySceneStudio(io.ComfyNode):
                     ],
                     tooltip="Enable shared high-resolution H3 spatial tiling.",
                 ),
-                io.Boolean.Input(
-                    "enhancer_enabled",
-                    default=False,
-                    tooltip=(
-                        "Enhance every segment's user_prompt into enhanced_prompt "
-                        "before rendering. Runs only when this node executes."
-                    ),
-                ),
                 TYPE_LLAMACPP_MODEL.Input(
                     "llama_model",
                     optional=True,
@@ -2628,29 +2652,44 @@ class EasySceneStudio(io.ComfyNode):
                     raw_link=True,
                     tooltip=(
                         "Local llama.cpp model input; evaluated only when the "
-                        "local provider is selected and enhancer_enabled is on."
+                        "local provider is selected and the prompt enhancer is on."
                     ),
                 ),
                 io.DynamicCombo.Input(
-                    "model",
-                    options=MultiTrackPromptEnhancer._model_options(
-                        force_synchronous=True,
-                    ),
-                    tooltip="Provider and model used to enhance every segment prompt.",
-                ),
-                io.Int.Input(
-                    "enhancer_seed",
-                    default=0,
-                    min=0,
-                    max=0xFFFFFFFFFFFFFFFF,
-                    control_after_generate=True,
-                    tooltip="ComfyUI generation seed used for prompt enhancement.",
-                ),
-                TYPE_PROMPT_ENHANCER_ACCOUNT.Input(
-                    "api_account",
+                    "enhancer_enabled",
+                    options=[
+                        io.DynamicCombo.Option("false", []),
+                        io.DynamicCombo.Option(
+                            "true",
+                            [
+                                io.DynamicCombo.Input(
+                                    "model",
+                                    options=MultiTrackPromptEnhancer._model_options(
+                                        force_synchronous=True,
+                                    ),
+                                    tooltip="Provider and model used to enhance every segment prompt.",
+                                ),
+                                io.Int.Input(
+                                    "enhancer_seed",
+                                    default=0,
+                                    min=0,
+                                    max=0xFFFFFFFFFFFFFFFF,
+                                    control_after_generate=True,
+                                    tooltip="ComfyUI generation seed used for prompt enhancement.",
+                                ),
+                                TYPE_PROMPT_ENHANCER_ACCOUNT.Input(
+                                    "api_account",
+                                    tooltip=(
+                                        "Provider balance and API key management. This widget is "
+                                        "for account status only and does not affect enhancement."
+                                    ),
+                                ),
+                            ],
+                        ),
+                    ],
                     tooltip=(
-                        "Provider balance and API key management. This widget is "
-                        "for account status only and does not affect enhancement."
+                        "Enhance every segment's user_prompt into enhanced_prompt "
+                        "before rendering. Runs only when this node executes."
                     ),
                 ),
             ],
@@ -2701,6 +2740,9 @@ class EasySceneStudio(io.ComfyNode):
             for name in _SCENE_STUDIO_PROJECT_INPUT_NAMES
             if name in kwargs
         }
+        project_name, project_save = _scene_studio_project_ref(kwargs.get("project_ref"))
+        project_kwargs["project_name"] = project_name
+        project_kwargs["project_save"] = project_save
 
         def render(final_tracks_info: dict) -> io.NodeOutput:
             project_output = _scene_studio_render(
@@ -2716,7 +2758,9 @@ class EasySceneStudio(io.ComfyNode):
                 expand=project_output.expand,
             )
 
-        enhancer_enabled = bool(_unwrap_list_scalar(kwargs.get("enhancer_enabled"), False))
+        enhancer_enabled, enhancer_config = _scene_studio_enhancer_config(
+            kwargs.get("enhancer_enabled"),
+        )
         if not enhancer_enabled:
             return render(tracks_info)
 
@@ -2725,7 +2769,7 @@ class EasySceneStudio(io.ComfyNode):
         if not tasks:
             return render(tracks_info)
 
-        model_config = _unwrap_list_scalar(kwargs.get("model"), {})
+        model_config = _unwrap_list_scalar(enhancer_config.get("model"), {})
         if not isinstance(model_config, dict):
             raise TypeError("model must be a DynamicCombo configuration dictionary.")
         synchronous_model_config = dict(model_config)
@@ -2736,9 +2780,9 @@ class EasySceneStudio(io.ComfyNode):
         configured_force_offload = bool(
             _unwrap_list_scalar(synchronous_model_config.get("force_offload"), True)
         )
-        selected_seed = int(_unwrap_list_scalar(kwargs.get("enhancer_seed"), 0))
+        selected_seed = int(_unwrap_list_scalar(enhancer_config.get("enhancer_seed"), 0))
         llama_model = kwargs.get("llama_model")
-        api_account = kwargs.get("api_account")
+        api_account = enhancer_config.get("api_account")
 
         task_media_info = info
         if info.get("task_markers"):
