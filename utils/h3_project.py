@@ -518,6 +518,49 @@ def h3_generation_mode(task_type: str) -> str:
     raise ValueError(f"Unsupported H3 task type: {task_type}")
 
 
+def _compact_h3_segment_loras(content: dict[str, Any]) -> list[dict[str, Any]]:
+    raw_loras = content.get("loras")
+    if not isinstance(raw_loras, list):
+        return []
+    compact_loras: list[dict[str, Any]] = []
+    for entry in raw_loras:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        try:
+            strength = float(entry.get("strength", 1.0))
+        except (TypeError, ValueError):
+            strength = 1.0
+        compact_loras.append({"name": name, "strength": strength})
+    return compact_loras
+
+
+def _compact_h3_segment_images(content: dict[str, Any]) -> list[dict[str, Any]]:
+    raw_images = content.get("images")
+    if not isinstance(raw_images, list):
+        return []
+    compact_images: list[dict[str, Any]] = []
+    for entry in raw_images:
+        if not isinstance(entry, dict):
+            continue
+        name = (
+            entry.get("file_name")
+            or entry.get("file_path")
+            or entry.get("url")
+            or entry.get("slot_name")
+        )
+        if not isinstance(name, str) or not name:
+            continue
+        compact_images.append({
+            "name": name,
+            "source_type": str(entry.get("source_type", "input")),
+            "shared_reference": bool(entry.get("shared_reference", False)),
+        })
+    return compact_images
+
+
 def compact_h3_task_segments(info: dict[str, Any]) -> list[dict[str, Any]]:
     """Return only task modes required to describe an H3 project."""
     compact: list[dict[str, Any]] = []
@@ -533,6 +576,8 @@ def compact_h3_task_segments(info: dict[str, Any]) -> list[dict[str, Any]]:
             ),
             "task_mode": str(content.get("task_mode", "default")),
             "audio_locked": h3_locked_audio_track(entry, info) is not None,
+            "loras": _compact_h3_segment_loras(content),
+            "images": _compact_h3_segment_images(content),
         })
     return compact
 

@@ -2672,6 +2672,10 @@ class EasyH3ProjectArtifact(io.ComfyNode):
             if isinstance(task_segment, dict):
                 task_mode = str(task_segment.get("task_mode", "default"))
                 generation_manifest["task_mode"] = task_mode
+                segment_loras = task_segment.get("loras")
+                generation_manifest["loras"] = segment_loras if isinstance(segment_loras, list) else []
+                segment_images = task_segment.get("images")
+                generation_manifest["images"] = segment_images if isinstance(segment_images, list) else []
         if target_context_latent_low is not None:
             generation_manifest["context_latent_low"] = (
                 target_context_latent_low.name

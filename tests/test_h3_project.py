@@ -160,17 +160,58 @@ def test_compact_project_tasks_keep_only_modes_and_index():
             "continuity_mode": "shot",
             "task_mode": "default",
             "audio_locked": False,
+            "loras": [],
+            "images": [],
         },
         {
             "index": 1,
             "continuity_mode": "context",
             "task_mode": "ref",
             "audio_locked": False,
+            "loras": [],
+            "images": [],
         },
     ]
     assert h3_project_filename_prefix("demo") == (
         "easy_media/projects/demo/out/demo"
     )
+
+
+def test_compact_project_tasks_records_segment_loras():
+    info = _tracks_info()
+    info["tracks"][0]["segments"][1]["content"]["loras"] = [
+        {"name": "style.safetensors", "strength": 0.8},
+        {"name": "", "strength": 1.0},
+        "not-a-dict",
+        {"name": "bad_strength.safetensors", "strength": "oops"},
+    ]
+
+    compact = compact_h3_task_segments(info)
+
+    assert compact[0]["loras"] == []
+    assert compact[1]["loras"] == [
+        {"name": "style.safetensors", "strength": 0.8},
+        {"name": "bad_strength.safetensors", "strength": 1.0},
+    ]
+
+
+def test_compact_project_tasks_records_segment_reference_images():
+    info = _tracks_info()
+    info["tracks"][0]["segments"][1]["content"]["images"] = [
+        {"file_name": "ref.png", "source_type": "input", "shared_reference": True},
+        {"file_path": "path/only.png"},
+        {"media_index": 0},
+        "not-a-dict",
+    ]
+
+    compact = compact_h3_task_segments(info)
+
+    # Segment 0's lone image entry has no identifying field (just media_index).
+    assert compact[0]["images"] == []
+    assert compact[1]["images"] == [
+        {"name": "ref.png", "source_type": "input", "shared_reference": True},
+        {"name": "path/only.png", "source_type": "input", "shared_reference": False},
+    ]
 
 
 def test_compact_project_tasks_migrate_context_swap_mode():
