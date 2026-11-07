@@ -2367,22 +2367,46 @@ _SCENE_STUDIO_PROJECT_INPUT_NAMES = (
 
 
 def _scene_studio_lora_resolver(content: dict) -> list[tuple[str, float]]:
-    """Resolve a segment's per-segment LoRA stack, ignoring unknown filenames."""
+    """Resolve a segment's per-segment LoRA stack.
+
+    Raises rather than silently skipping an unresolvable entry: a LoRA that
+    fails to apply should be a loud, fail-fast error (especially for
+    automated/API-driven submissions with no interactive UI to notice a
+    silently-dropped LoRA), not an invisible no-op that wastes a render.
+    """
+    legacy_lora_name = content.get("lora_name")
+    if isinstance(legacy_lora_name, str) and legacy_lora_name:
+        raise ValueError(
+            f"Segment has a 'lora_name' field ({legacy_lora_name!r}), which is "
+            "no longer used and is silently ignored by rendering. Put every "
+            "LoRA this segment should use in its 'loras' array instead: "
+            '"loras": [{"name": "...", "strength": 1.0}, ...]. There is no '
+            "apply-to-every-segment shortcut — a LoRA needed on multiple "
+            "segments must be listed in each one's own 'loras' array."
+        )
     raw_loras = content.get("loras")
     if not isinstance(raw_loras, list):
         return []
-    available = set(folder_paths.get_filename_list("loras"))
+    available = folder_paths.get_filename_list("loras")
+    available_set = set(available)
     resolved: list[tuple[str, float]] = []
     for entry in raw_loras:
         if not isinstance(entry, dict):
-            continue
+            raise ValueError(f"Segment lora entry must be an object, got: {entry!r}")
         lora_name = entry.get("name")
-        if not isinstance(lora_name, str) or not lora_name or lora_name not in available:
-            continue
+        if not isinstance(lora_name, str) or not lora_name:
+            raise ValueError(f"Segment lora entry is missing a valid 'name': {entry!r}")
+        if lora_name not in available_set:
+            raise ValueError(
+                f"Segment lora {lora_name!r} was not found in the loras folder. "
+                f"Available: {sorted(available)}"
+            )
         try:
             strength = float(entry.get("strength", 1.0))
-        except (TypeError, ValueError):
-            strength = 1.0
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                f"Segment lora {lora_name!r} has an invalid strength: {entry.get('strength')!r}"
+            ) from error
         resolved.append((lora_name, strength))
     return resolved
 
