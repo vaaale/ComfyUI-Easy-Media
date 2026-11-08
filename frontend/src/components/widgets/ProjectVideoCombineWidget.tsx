@@ -9,6 +9,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/comp
 import { useCanvasScale } from '@/hooks/use-canvas-scale'
 import { useElementWidth } from '@/hooks/use-element-width'
 import { usePauseMediaOnPageExit } from '@/hooks/use-pause-media-on-page-exit'
+import { useWheelHorizontalScroll } from '@/hooks/use-wheel-horizontal-scroll'
 import type { ReactWidgetProps } from '@/lib/create-react-widget'
 import { LocaleContext, translate } from '@/lib/i18n'
 import { addMediaRevision, mediaContentToViewUrl } from '@/lib/media-url'
@@ -242,6 +243,7 @@ export function ProjectVideoCombineWidget({ value, onChange, app, node }: Readon
   const canvasScale = useCanvasScale(app)
   const timelineWidth = Math.max(1, useElementWidth(timelineContainerRef))
   const scaledTimelineWidth = timelineWidth * zoom
+  useWheelHorizontalScroll(timelineContainerRef)
   const total = totalFrames(data.clips)
   const active = clipAtFrame(data.clips, Math.min(currentFrame, Math.max(0, total - 1)))
   const activeUrl = active ? projectClipUrl(active.clip) : null

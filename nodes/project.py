@@ -44,6 +44,7 @@ from ..utils.project_memory import (
     install_project_memory_cleanup,
 )
 from ..utils.multitrack import _parse_track_data
+from ..utils.scenes import save_scene
 from .basic import (
     LLAMACPP_MODEL,
     MINIMAX_MODEL,
@@ -2732,6 +2733,15 @@ class EasySceneStudio(io.ComfyNode):
 
     @classmethod
     def execute(cls, **kwargs: Any) -> io.NodeOutput:
+        # Persist the scene snapshot on every execution (not just interactive
+        # edits in the UI) so a project submitted directly to /api/prompt --
+        # e.g. by an automated agent, with no live canvas session to trigger
+        # the frontend's auto-save -- can still be reloaded by name afterward.
+        save_scene(
+            safe_h3_project_name(_unwrap_list_scalar(kwargs.get("project_name"), "")),
+            _parse_track_data(_unwrap_list_scalar(kwargs.get("track_data"), {})),
+        )
+
         editor_output = MultiTrackEditor.execute(
             resolution=kwargs.get("resolution"),
             format=kwargs.get("format"),

@@ -6,6 +6,7 @@ import { useCanvasScale } from '@/hooks/use-canvas-scale'
 import { useElementWidth } from '@/hooks/use-element-width'
 import { useMultiTrackHistory } from '@/hooks/use-multitrack-history'
 import { useMultiTrackResolutionInput } from '@/hooks/use-multitrack-resolution-input'
+import { useWheelHorizontalScroll } from '@/hooks/use-wheel-horizontal-scroll'
 import type { ReactWidgetProps } from '@/lib/create-react-widget'
 import { LocaleContext, translate } from '@/lib/i18n'
 import {
@@ -169,30 +170,7 @@ export function MultiTrackWidget({ value, onChange, app, node }: Readonly<ReactW
   const canvasScale = useCanvasScale(app)
   const resolutionInput = useMultiTrackResolutionInput(node)
   const isSceneStudio = (node.comfyClass ?? node.type) === 'easy sceneStudio'
-  // React's wheel listener can be passive; cancel native scrolling before moving the timeline.
-  // useLayoutEffect attaches the non-passive listener before paint so the very first wheel
-  // gesture on the timeline is intercepted rather than falling through to native scroll.
-  useLayoutEffect(() => {
-    const container = timelineContainerRef.current
-    if (!container) return
-
-    function handleWheel(event: WheelEvent) {
-      if (!container || container.scrollWidth <= container.clientWidth || event.ctrlKey || event.metaKey) return
-      if (event.target instanceof Element && event.target.closest('[data-capture-wheel="true"]')) return
-
-      event.preventDefault()
-
-      const unit = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? container.clientWidth : 1
-      const delta = Math.abs(event.deltaX) > Math.abs(event.deltaY) ? event.deltaX : event.deltaY
-      container.scrollLeft = Math.max(0, Math.min(
-        container.scrollWidth - container.clientWidth,
-        container.scrollLeft + delta * unit,
-      ))
-    }
-
-    container.addEventListener('wheel', handleWheel, { passive: false })
-    return () => container.removeEventListener('wheel', handleWheel)
-  }, [timelineContainerRef])
+  useWheelHorizontalScroll(timelineContainerRef)
   useLayoutEffect(() => {
     const previousTime = previousViewportTimeRef.current
     previousViewportTimeRef.current = currentTime
