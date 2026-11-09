@@ -1626,5 +1626,20 @@
       "0": { "name": "正向条件" },
       "1": { "name": "潜空间" }
     }
+  },
+  "easy workflowTheme": {
+    "display_name": "工作流主题",
+    "description": "为此工作流的 EasyMedia 节点和画布选择一个视觉主题。纯粹是装饰性的，仅由前端读取，对执行没有影响。未添加此节点的工作流将保持默认的 ComfyUI 外观。",
+    "inputs": {
+      "theme": {
+        "name": "主题",
+        "options": {
+          "ComfyUI default": "ComfyUI 默认",
+          "Slate": "石板灰",
+          "Midnight": "午夜蓝",
+          "Paper": "纸白"
+        }
+      }
+    }
   }
 }

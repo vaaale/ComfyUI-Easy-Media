@@ -15,6 +15,12 @@ import { DEFAULT_PROJECT_DATA } from '@/types/project'
 import { suppressCompareVideoDefaultPreview } from '@/lib/compare-video-node'
 import { installWorkflowSubmission } from '@/lib/workflow-submission'
 import { installProjectSamplingPreview } from '@/lib/project-sampling-preview-node'
+import {
+  installWorkflowTheme,
+  wireWorkflowThemeNode,
+  themeNodeOnCreate,
+  themeAfterConfigureGraph,
+} from '@/lib/workflow-theme'
 
 declare const __COMFY_EASY_MEDIA_GLOBAL_CSS__: string;
 
@@ -51,6 +57,7 @@ comfyApp.registerExtension({
   async setup() {
     installWidgetTheme()
     installWorkflowSubmission(comfyApp)
+    installWorkflowTheme(comfyApp)
     addInlineStyles(
       __COMFY_EASY_MEDIA_GLOBAL_CSS__,
       `${import.meta.env.PROJECT_NAME}-globals`,
@@ -65,11 +72,20 @@ comfyApp.registerExtension({
     installEasyMediaSyncPlay(nodeType, nodeData)
     suppressCompareVideoDefaultPreview(nodeType, nodeData)
     installProjectSamplingPreview(nodeType, nodeData, comfyApp)
+    wireWorkflowThemeNode(nodeType, nodeData, comfyApp)
   },
 
   getNodeMenuItems(node) {
     const locale = comfyApp.ui?.settings?.settingsValues?.['Comfy.Locale']
     return getEasyMediaSyncPlayMenuItems(node, comfyApp.canvas, locale)
+  },
+
+  afterConfigureGraph() {
+    themeAfterConfigureGraph(comfyApp)
+  },
+
+  nodeCreated() {
+    themeNodeOnCreate(comfyApp)
   },
 
   getCustomWidgets() {

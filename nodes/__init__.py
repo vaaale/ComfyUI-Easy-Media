@@ -9,4 +9,5 @@ from .project import *
 from .video import *
 from .rtx_vsr import *
 from .subtitle import *
+from .theme import *
 from .wan import *

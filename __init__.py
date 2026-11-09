@@ -94,6 +94,8 @@ class EasyMediaExtension(ComfyExtension):
             EasyModelLoaderPack,
             MatchLine,
             APIWorkflowGate,
+            # Theme
+            EasyWorkflowTheme,
             # MiniMax
             EasyMiniMaxH3MotionContextHard,
             EasyMiniMaxH3ContextSwap,
